@@ -28,7 +28,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: app-linux
-          path: target/x86_64-unknown-linux-musl/release/m3u8
+          path: target/x86_64-unknown-linux-musl/release/m3u8-dl
   windows:
     runs-on: windows-2022
     steps:
@@ -44,7 +44,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: app-windows
-          path: target/release/m3u8.exe
+          path: target/release/m3u8-dl.exe
   mac: 
     runs-on: macos-13
     steps:
@@ -55,12 +55,12 @@ jobs:
           toolchain: ${{ env.RUST_VERSION }}
       - name: Build
         run: |
-          cargo build --release && tree && mv target/release/m3u8 target/release/m3u8-mac
+          cargo build --release && mv target/release/m3u8-dl target/release/m3u8-dl-mac
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: app-mac
-          path: target/release/m3u8
+          path: target/release/m3u8-dl-mac
   release:
     runs-on: ubuntu-20.04
     needs: ["mac","linux","windows"]
