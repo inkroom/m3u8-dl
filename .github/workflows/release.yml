@@ -1,0 +1,83 @@
+name: release
+
+on:
+  push:
+    branches: ['master']
+    paths-ignore:
+      - 'README.md'
+      - '.gitignore'
+      - '.dockerignore'
+  workflow_dispatch:
+env:
+  RUST_VERSION: 1.83.0
+jobs:
+  linux: 
+    runs-on: ubuntu-20.04
+    container:
+      image: ghcr.io/inkroomtemp/rust_musl_build:1.83.0
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Build
+        run: |
+          env
+          rustup show
+          mkdir out
+          cargo build --release --target=x86_64-unknown-linux-musl
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-linux
+          path: target/x86_64-unknown-linux-musl/release/m3u8
+  windows:
+    runs-on: windows-2022
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+      - name: Build
+        run: |
+          cargo build --release
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-windows
+          path: target/release/m3u8.exe
+  mac: 
+    runs-on: macos-13
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+      - name: Build
+        run: |
+          cargo build --release && mv target/release/m3u8 target/release/m3u8-mac
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-mac
+          path: target/release/m3u8
+  release:
+    runs-on: ubuntu-20.04
+    needs: ["mac","linux","windows"]
+    permissions:
+        contents: write
+        packages: write
+    steps:
+        - name: Checkout repository
+          uses: actions/checkout@v4
+        - name: Download artifacts
+          uses: actions/download-artifact@v4
+          with:
+            merge-multiple: true
+            pattern: app-*
+            path: app/
+        - name: Release
+          env:
+            GH_TOKEN: ${{ github.token }}
+          run: |
+            gh release create --target master $(date +%Y%m%d) ./app/*

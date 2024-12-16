@@ -1,0 +1,21 @@
+[package]
+name = "m3u8-dl"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+clap = { version = "4.5.23", features = ["derive"] }
+crossbeam = { version = "0.8.4", features = ["crossbeam-queue"] }
+log = "0.4.22"
+
+m3u8-rs = "6.0.0"
+minreq = { version = "2.13.0", features = ["https-rustls","proxy"] }
+simple-log = "2.1.1"
+url = "2.5.4"
+libc = "0.2.168"
+
+[profile.release]
+opt-level = 's'
+lto = true
+panic = 'abort'
+debug = false
