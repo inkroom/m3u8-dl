@@ -5,31 +5,40 @@ use m3u8_rs::{MediaPlaylist, Playlist};
 
 #[derive(Parser, Debug)]
 struct Opt {
-    #[arg(long = "url", help = "m3u8地址")]
+    #[arg(short, long = "url", help = "m3u8地址")]
     url: String,
-    #[arg(long = "dir", help = "输出文件夹")]
+    #[arg(short, long = "dir", help = "输出文件夹")]
     dir: String,
-    #[arg(short, long, help = "输出文件位置")]
+    #[arg(short, long, help = "输出文件名，必须以mp4或者mkv结尾")]
     name: String,
-    #[cfg(target_os = "linux")]
-    #[arg(long, help = "使用权限uid")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[arg(long, help = "使用指定uid运行程序(unavailable for window)")]
     uid: Option<u32>,
-    #[arg(long, default_value = "4", help = "线程数量")]
-    thred: u32,
+    #[arg(short,long, default_value = "4", help = "线程数量")]
+    thread: u32,
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    #[arg(short, help = "后台运行", default_value = "false")]
+    #[arg(
+        long,
+        help = "后台运行(unavailable for windows)",
+        default_value = "false"
+    )]
     daemon: bool,
-    #[arg(long, help = "配置输出到日志文件")]
+    #[arg(short, long, help = "日志文件位置")]
     log: Option<String>,
-    #[arg(long, help = "完成后删除ts文件", default_value = "false")]
-    delete: bool,
+    #[arg(short, long, help = "完成删除中间文件", default_value = "false")]
+    clear: bool,
     #[arg(short, long, help = "跳过ts文件开头字节数", default_value = "0")]
     skip: usize,
     #[arg(short, long, help = "下载重试次数", default_value = "3")]
     retry: usize,
     #[arg(long, help = "代理,如127.0.0.1:7382")]
     proxy: Option<String>,
-    #[arg(long, help = "不使用代理", default_value = "false")]
+    #[arg(
+        long,
+        help = "不使用代理",
+        default_value = "false",
+        long_help = "如无该参数，将会尝试使用环境中的代理配置"
+    )]
     no_proxy: bool,
     #[arg(long, help = "ffmpeg可执行文件位置", default_value = "ffmpeg")]
     ffmpeg: String,
@@ -40,8 +49,8 @@ struct Opt {
         default_value = "false"
     )]
     replace_not_found: bool,
-    #[arg(short, long, default_value = "false")]
-    verobe: bool,
+    #[arg(short, long, default_value = "false", help = "输出更多日志")]
+    verbose: bool,
 }
 
 fn main() {
@@ -49,7 +58,7 @@ fn main() {
 
     // println!("{:?}", opt);
     let s = simple_log::LogConfigBuilder::builder()
-        .level(if opt.verobe {
+        .level(if opt.verbose {
             "debug,rustls=info"
         } else {
             "info"
@@ -110,7 +119,7 @@ fn main() {
 }
 
 fn run(opt: Opt) -> Result<(), String> {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     if let Some(uid) = opt.uid {
         unsafe {
             let _ = libc::setuid(uid);
@@ -149,7 +158,7 @@ fn run(opt: Opt) -> Result<(), String> {
                         )
                         .as_str(),
                         out.as_str(),
-                        opt.thred,
+                        opt.thread,
                         &opt,
                     )?;
                 }
@@ -239,18 +248,14 @@ fn get_real_url(m3u8: &str, uri: &str) -> Result<String, String> {
 
 fn download_inner(url: &str, opt: &Opt) -> Result<minreq::Response, String> {
     let mut req = minreq::get(url);
-    unsafe {
-        if !opt.no_proxy {
-            if let Some(proxy) = &opt.proxy {
-                req = req.with_proxy(
-                    minreq::Proxy::new(proxy).map_err(|e| format!("proxy not valid {e}"))?,
-                );
-            } else if let Some(proxy) = get_env_proxy(url) {
-                log::info!("use proxy ={proxy}");
-                req = req.with_proxy(
-                    minreq::Proxy::new(proxy).map_err(|e| format!("proxy not valid {e}"))?,
-                );
-            }
+    if !opt.no_proxy {
+        if let Some(proxy) = &opt.proxy {
+            req = req
+                .with_proxy(minreq::Proxy::new(proxy).map_err(|e| format!("proxy not valid {e}"))?);
+        } else if let Some(proxy) = get_env_proxy(url) {
+            log::info!("use proxy ={proxy}");
+            req = req
+                .with_proxy(minreq::Proxy::new(proxy).map_err(|e| format!("proxy not valid {e}"))?);
         }
     }
     req.send().map_err(|e| e.to_string())
@@ -356,7 +361,7 @@ fn concat(files: Vec<String>, out: &str, opt: &Opt) -> Result<(), String> {
         ));
     }
 
-    if opt.delete {
+    if opt.clear {
         let dir = Path::system(files[0].as_str()).pop();
         if let Err(e) = std::fs::remove_dir_all(dir.to_string()) {
             log::warn!("删除ts文件失败 ={} {e}", dir.to_string());
