@@ -16,6 +16,7 @@ struct Opt {
     uid: Option<u32>,
     #[arg(long, default_value = "4", help = "线程数量")]
     thred: u32,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[arg(short, help = "后台运行", default_value = "false")]
     daemon: bool,
     #[arg(long, help = "配置输出到日志文件")]
@@ -32,6 +33,15 @@ struct Opt {
     no_proxy: bool,
     #[arg(long, help = "ffmpeg可执行文件位置", default_value = "ffmpeg")]
     ffmpeg: String,
+    #[arg(
+        long,
+        help = "处理404",
+        long_help = "当ts返回404时，使用最近的已下载的ts替换",
+        default_value = "false"
+    )]
+    replace_not_found: bool,
+    #[arg(short, long, default_value = "false")]
+    verobe: bool,
 }
 
 fn main() {
@@ -39,7 +49,11 @@ fn main() {
 
     // println!("{:?}", opt);
     let s = simple_log::LogConfigBuilder::builder()
-        .level("info")
+        .level(if opt.verobe {
+            "debug,rustls=info"
+        } else {
+            "info"
+        })
         .unwrap()
         .time_format("%Y-%m-%d %H:%M:%S.%f")
         .output_console();
@@ -51,7 +65,7 @@ fn main() {
     }
 
     log::info!("参数={:?}", opt);
-
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     if opt.daemon {
         unsafe {
             let pid = libc::fork();
@@ -103,10 +117,16 @@ fn run(opt: Opt) -> Result<(), String> {
             let _ = libc::setgid(uid);
         }
     }
-
     if !opt.name.as_str().ends_with(".mp4") && !opt.name.as_str().ends_with(".mkv") {
         return Err("name 必须有文件格式".to_string());
     }
+
+    let out = format!("{}/{}", opt.dir, opt.name);
+    if std::fs::exists(out.as_str()).unwrap_or(false) {
+        log::info!("the out file exists = [{out}] ");
+        return Ok(());
+    }
+
     log::info!("downloading m3u8 {}", opt.url);
 
     let resp = download_inner(opt.url.as_str(), &opt)?;
@@ -128,7 +148,7 @@ fn run(opt: Opt) -> Result<(), String> {
                             opt.name.replace(".mp4", "").replace(".mkv", "")
                         )
                         .as_str(),
-                        format!("{}/{}", opt.dir, opt.name).as_str(),
+                        out.as_str(),
                         opt.thred,
                         &opt,
                     )?;
@@ -174,7 +194,7 @@ fn download(
                             download_item(url.as_str(), file.as_str(), opt, now, segment_count)
                         {
                             log::error!(
-                                "download file fail ={url}, reason ={e} after retry {i} count"
+                                "download file fail ={url}, reason =[{e}] after retry {i} count"
                             );
                         } else {
                             // 成功
@@ -226,6 +246,7 @@ fn download_inner(url: &str, opt: &Opt) -> Result<minreq::Response, String> {
                     minreq::Proxy::new(proxy).map_err(|e| format!("proxy not valid {e}"))?,
                 );
             } else if let Some(proxy) = get_env_proxy(url) {
+                log::info!("use proxy ={proxy}");
                 req = req.with_proxy(
                     minreq::Proxy::new(proxy).map_err(|e| format!("proxy not valid {e}"))?,
                 );
@@ -256,16 +277,36 @@ fn download_item(url: &str, path: &str, opt: &Opt, now: usize, total: usize) -> 
     }
 
     let resp = download_inner(url, opt)?;
-    if let Some(len) = resp.headers.get("content-length") {
-        let v = resp.as_bytes();
-        if v.len() == len.parse::<usize>().map_err(|e| e.to_string())? {
-            log::info!("url = {url} path={path} {now}/{total}");
-            std::fs::write(path, &v[opt.skip..]).map_err(|e| e.to_string())?;
+    if resp.status_code == 200 {
+        if let Some(len) = resp.headers.get("content-length") {
+            let v = resp.as_bytes();
+            if v.len() == len.parse::<usize>().map_err(|e| e.to_string())? {
+                log::info!("url = {url} path={path} {now}/{total}");
+                std::fs::write(path, &v[opt.skip..]).map_err(|e| e.to_string())?;
+            } else {
+                return Err("len not eq".to_string());
+            }
         } else {
-            return Err("len not eq".to_string());
+            return Err("no cotent-length".to_string());
+        }
+    } else if resp.status_code == 404 && opt.replace_not_found {
+        // 找到最近的下载成功的ts文件，就是上一个
+        for i in (0..now - 1).rev() {
+            let p = Path::system(path).pop().join(format!("{i}.ts").as_str());
+            if std::fs::exists(p.to_string().as_str()).unwrap_or(false) {
+                if let Ok(_) = std::fs::copy(p.to_string().as_str(), path) {
+                    log::info!(
+                        "file {path} not found, use the file [{}] replace it",
+                        p.to_string()
+                    );
+                };
+            }
         }
     } else {
-        return Err("no cotent-length".to_string());
+        return Err(format!(
+            "down file {url} fail, because the server return {}",
+            resp.status_code
+        ));
     }
 
     Ok(())
@@ -276,21 +317,22 @@ fn concat(files: Vec<String>, out: &str, opt: &Opt) -> Result<(), String> {
         log::warn!("输出文件 {out} 已存在");
         return Ok(());
     }
-
-    // 校验所有文件都已下载成功
-    if files
+    let not_download_file = files
         .iter()
-        .map(|f| std::fs::exists(f.as_str()).unwrap_or(false))
-        .any(|f| !f)
-    {
-        log::warn!("文件未下载完成，不合并");
+        .map(|f| f.as_str())
+        .filter(|f| !std::fs::exists(f).unwrap_or(false))
+        .collect::<Vec<&str>>();
+    // 校验所有文件都已下载成功
+    if !not_download_file.is_empty() {
+        log::warn!("文件未下载完成，不合并 [{}]", not_download_file.join(","));
         return Err("文件未下载完成，不合并".to_string());
     }
 
-    log::info!("start ffmpeg");
+    log::info!("start ffmpeg, the out file = {out}");
     let c = std::process::Command::new(opt.ffmpeg.as_str())
         .arg("-i")
         .arg(format!("concat:{}", files.join("|").as_str()).as_str())
+        .arg("-y")
         .arg("-c")
         .arg("copy")
         .arg(out)

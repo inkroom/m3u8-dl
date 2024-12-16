@@ -12,6 +12,8 @@ m3u8-rs = "6.0.0"
 minreq = { version = "2.13.0", features = ["https-rustls","proxy"] }
 simple-log = "2.1.1"
 url = "2.5.4"
+
+[target.'cfg(not(target_os="windows"))'.dependencies]
 libc = "0.2.168"
 
 [profile.release]

@@ -55,7 +55,7 @@ jobs:
           toolchain: ${{ env.RUST_VERSION }}
       - name: Build
         run: |
-          cargo build --release && mv target/release/m3u8 target/release/m3u8-mac
+          cargo build --release && tree && mv target/release/m3u8 target/release/m3u8-mac
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
