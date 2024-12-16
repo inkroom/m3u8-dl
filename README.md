@@ -24,3 +24,11 @@ Options:
       --ffmpeg <FFMPEG>  ffmpeg可执行文件位置 [default: ffmpeg]
   -h, --help             Print help
 ```
+
+## 构建
+
+最低rust版本 1.81.0
+
+```shell
+cargo build
+```
