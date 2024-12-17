@@ -139,63 +139,75 @@ fn run(opt: Opt) -> Result<(), String> {
         return Ok(());
     }
 
-    log::info!("downloading m3u8 {}", opt.url);
+    let ts = get_m3u8_ts_url(opt.url.as_str(), "", &opt)?;
 
-    let resp = download_inner(opt.url.as_str(), &opt)?;
+    download(
+        ts.iter().map(|f| f).collect::<Vec<&String>>().as_slice(),
+        format!(
+            "{}/{}",
+            opt.dir,
+            opt.name.replace(".mp4", "").replace(".mkv", "")
+        )
+        .as_str(),
+        out.as_str(),
+        &opt,
+    )?;
 
-    if let Some(len) = resp.headers.get("content-length") {
-        let v = resp.as_bytes();
-        if v.len() == len.parse::<usize>().map_err(|e| e.to_string())? {
-            match m3u8_rs::parse_playlist_res(v) {
-                Ok(Playlist::MasterPlaylist(m)) => {
-                    // 套娃，暂时不考虑
-                }
-                Ok(Playlist::MediaPlaylist(me)) => {
-                    download(
-                        &me,
-                        opt.url.as_str(),
-                        format!(
-                            "{}/{}",
-                            opt.dir,
-                            opt.name.replace(".mp4", "").replace(".mkv", "")
-                        )
-                        .as_str(),
-                        out.as_str(),
-                        opt.thread,
-                        &opt,
-                    )?;
-                }
-                Err(e) => return Err(e.to_string()),
-            };
-        }
-    }
     log::info!("下载完成 {} ", opt.url);
     Ok(())
 }
 
-fn download(
-    list: &MediaPlaylist,
-    m3u8: &str,
-    dir: &str,
-    out: &str,
-    thread: u32,
-    opt: &Opt,
-) -> Result<(), String> {
+fn get_m3u8_ts_url(url: &str, uri: &str, opt: &Opt) -> Result<Vec<String>, String> {
+    let m3u8_url = url::Url::parse(url)
+        .and_then(|f| f.join(uri))
+        .map_err(|e| format!("m3u8 url not valid {}", e))?;
+    log::info!("downloading m3u8 {}", m3u8_url);
+
+    let resp = download_inner(m3u8_url.as_str(), opt)?;
+    if resp.status_code == 200 {
+        match m3u8_rs::parse_playlist_res(resp.as_bytes()) {
+            Ok(Playlist::MasterPlaylist(m)) => {
+                let mut v = Vec::new();
+                for ele in &m.variants {
+                    v.append(&mut get_m3u8_ts_url(
+                        m3u8_url.as_str(),
+                        ele.uri.as_str(),
+                        opt,
+                    )?);
+                }
+                return Ok(v);
+            }
+            Ok(Playlist::MediaPlaylist(me)) => {
+                return Ok(me
+                    .segments
+                    .iter()
+                    .map(|f| get_real_url(m3u8_url.as_str(), f.uri.as_str()))
+                    .filter(|f| f.is_ok())
+                    .map(|f| f.unwrap().to_string())
+                    .collect::<Vec<String>>());
+            }
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    Err(format!("resp error {} {}", resp.status_code, m3u8_url))
+}
+
+fn download(list: &[&String], dir: &str, out: &str, opt: &Opt) -> Result<(), String> {
     std::fs::create_dir_all(dir).map_err(|e| format!("create dir = {}", e.to_string()))?;
 
     let queue = std::sync::Arc::new(crossbeam::queue::SegQueue::new());
-    let segment_count = list.segments.len();
-    for (index, ele) in list.segments.iter().enumerate() {
+    let segment_count = list.len();
+    for (index, ele) in list.iter().enumerate() {
         // ele.uri
         // println!("{}", ele.uri);
-        let v = get_real_url(m3u8, ele.uri.as_str())?;
-
+        // let v = get_real_url(m3u8, ele.as_str())?;
+        let v = ele;
         queue.push((v.clone(), format!("{dir}/{}.ts", index)));
     }
     let thread_queue = Arc::clone(&queue);
     // 消费
     crossbeam::scope(|sc| {
-        for i in 0..thread {
+        for i in 0..opt.thread {
             let s = Arc::clone(&thread_queue);
             sc.spawn(move |_| {
                 while let Some((url, file)) = s.pop() {
@@ -228,8 +240,7 @@ fn download(
     }
 
     concat(
-        list.segments
-            .iter()
+        list.iter()
             .enumerate()
             .map(|(index, _)| format!("{dir}/{index}.ts"))
             .collect::<Vec<String>>(),
@@ -443,5 +454,11 @@ mod tests {
         let mut p = Path::system("测试/2");
         p = p.join("..").join("out.mp4");
         println!("{}", p.to_string());
+
+        let v =
+            url::Url::parse("https://vpx05.myself-bbs.com/hls/eQ/oA/Ak/AgADeQoAAkpxIVU/index.m3u8")
+                .unwrap();
+        println!("{v}");
+        println!("{}", v.join("").unwrap());
     }
 }
