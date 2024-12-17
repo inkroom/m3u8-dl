@@ -72,6 +72,9 @@ jobs:
     steps:
         - name: Checkout repository
           uses: actions/checkout@v4
+          with:
+            fetch-tags: true
+            fetch-depth: 0
         - name: Download artifacts
           uses: actions/download-artifact@v4
           with:
@@ -82,4 +85,14 @@ jobs:
           env:
             GH_TOKEN: ${{ github.token }}
           run: |
-            gh release create --target master $(date +%Y%m%d) ./app/*
+            new_tag=$(date +%Y%m%d)
+            now_tag=$(curl -sSf https://api.github.com/repos/inkroom/m3u8-dl/releases/latest | jq --raw-output '.tag_name')
+            if [[ "$new_tag" = "$now_tag" ]]
+            then
+              gh release delete $now_tag
+              now_tag=$(curl -sSf https://api.github.com/repos/inkroom/m3u8-dl/releases | jq --raw-output '.[0].tag_name')
+            fi
+            commit=$(git rev-list -n 1 $now_tag)
+            msg=$(git --no-pager log --pretty=format:"%s" $commit..HEAD | awk '{print "- " $0}')
+            echo "$commit"
+            gh release create -n "$msg" --target master $(date +%Y%m%d) ./app/*
