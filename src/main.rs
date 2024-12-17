@@ -1,6 +1,7 @@
 use std::{ffi::CString, sync::Arc};
 
 use clap::Parser;
+use crypto::digest::Digest;
 use m3u8_rs::Playlist;
 
 #[derive(Parser, Debug)]
@@ -182,12 +183,16 @@ fn get_m3u8_ts_url(
                 return Ok(v);
             }
             Ok(Playlist::MediaPlaylist(me)) => {
+                // 如果有需要解密的key，这个key只会出现在第0个ts上，但是每个ts都需要用
+
+                let key = me.segments[0].key.clone();
+
                 return Ok(me
                     .segments
                     .iter()
                     .map(|f| {
                         (
-                            f.key.clone(),
+                            key.clone(),
                             get_real_url(m3u8_url.as_str(), f.uri.as_str()),
                         )
                     })
@@ -232,6 +237,7 @@ fn download(
                             &key,
                             url.as_str(),
                             file.as_str(),
+                            dir,
                             opt,
                             now,
                             segment_count,
@@ -313,6 +319,7 @@ fn download_item(
     key: &Option<m3u8_rs::Key>,
     url: &str,
     path: &str,
+    dir: &str,
     opt: &Opt,
     now: usize,
     total: usize,
@@ -327,7 +334,7 @@ fn download_item(
             let v = resp.as_bytes();
             if v.len() == len.parse::<usize>().map_err(|e| e.to_string())? {
                 log::info!("url = {url} path={path} {now}/{total}");
-                let v = decrypt(key, v, opt)?;
+                let v = decrypt(key, v, dir, opt)?;
                 std::fs::write(path, &v[opt.skip..]).map_err(|e| e.to_string())?;
             } else {
                 return Err("len not eq".to_string());
@@ -339,7 +346,9 @@ fn download_item(
         // 找到最近的下载成功的ts文件，就是上一个
         for i in (0..now - 1).rev() {
             let p = Path::system(path).pop().join(format!("{i}.ts").as_str());
-            if std::fs::exists(p.to_string().as_str()).unwrap_or(false) && std::fs::copy(p.to_string().as_str(), path).is_ok() {
+            if std::fs::exists(p.to_string().as_str()).unwrap_or(false)
+                && std::fs::copy(p.to_string().as_str(), path).is_ok()
+            {
                 log::info!(
                     "file {path} not found, use the file [{}] replace it",
                     p.to_string()
@@ -391,6 +400,7 @@ fn aes128_cbc_decrypt(
     key: &[u8; 16],
     iv: &[u8; 16],
 ) -> Result<Vec<u8>, SymmetricCipherError> {
+    log::debug!("do decrypt");
     let mut decryptor = aes::cbc_decryptor(aes::KeySize::KeySize128, key, iv, PkcsPadding);
 
     let mut buffer = [0; 4096];
@@ -404,7 +414,8 @@ fn aes128_cbc_decrypt(
             write_buffer
                 .take_read_buffer()
                 .take_remaining()
-                .iter().copied(),
+                .iter()
+                .copied(),
         );
         match result {
             crypto::buffer::BufferResult::BufferUnderflow => break,
@@ -416,8 +427,9 @@ fn aes128_cbc_decrypt(
 }
 
 fn decrypt<'a>(
-    key: &'a Option<m3u8_rs::Key>,
-    value: &'a [u8],
+    key: &Option<m3u8_rs::Key>,
+    value: &[u8],
+    dir: &str,
     opt: &Opt,
 ) -> Result<Vec<u8>, String> {
     if let Some(key) = key {
@@ -429,31 +441,41 @@ fn decrypt<'a>(
             m3u8_rs::KeyMethod::Other(v) => return Err(format!("unsupport decrypt method {v}")),
             m3u8_rs::KeyMethod::AES128 => {
                 log::info!("start decrypt");
-                // key.
-                // use aes::cipher::{
-                //     generic_array::GenericArray, BlockCipher, BlockDecrypt, BlockEncrypt, KeyInit,
-                // };
-                // use aes::Aes128;
                 if let Some(iv) = key
                     .iv
                     .as_ref()
                     .map(|f| f.replace("0x", ""))
                     .and_then(|f| hex_string_to_bytes(f.as_str()))
                 {
-                    // 获取key
-                    if let Some(v) = key
+                    let v: Option<[u8; 16]> = key
                         .uri
                         .as_ref()
-                        .and_then(|f| download_inner(f.as_str(), opt).ok())
-                    {
-                        let k: [u8; 16] = v
-                            .as_bytes()
-                            .try_into()
-                            .map_err(|f| format!("decrypt e {f}"))?;
+                        .map(|f| {
+                            let mut hash = crypto::md5::Md5::new();
+                            hash.input_str(f.as_str());
 
+                            (format!("{dir}/{}.key", hash.result_str()), f.as_str())
+                        })
+                        .and_then(|(path, uri)| {
+                            log::debug!("read the aes key from file {path}");
+                            std::fs::read(path.as_str())
+                                .or_else(|_| {
+                                    log::debug!("download the key file from uri = {uri}");
+                                    // 读取uri
+                                    download_inner(uri, opt).map(|f| {
+                                        let _ = std::fs::write(path.as_str(), f.as_bytes());
+                                        f.as_bytes().to_vec()
+                                    })
+                                })
+                                .ok()
+                        })
+                        .and_then(|f| f.try_into().ok());
+
+                    // 获取key
+                    if let Some(v) = v {
                         return aes128_cbc_decrypt(
                             value,
-                            &k,
+                            &v,
                             &iv.try_into().map_err(|f| format!("decrypt e {:?}", f))?,
                         )
                         .map_err(|f| format!("decrypt fail {:?}", f));
