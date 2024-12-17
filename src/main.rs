@@ -1,7 +1,7 @@
 use std::{ffi::CString, sync::Arc};
 
 use clap::Parser;
-use m3u8_rs::{MediaPlaylist, Playlist};
+use m3u8_rs::Playlist;
 
 #[derive(Parser, Debug)]
 struct Opt {
@@ -142,7 +142,7 @@ fn run(opt: Opt) -> Result<(), String> {
     let ts = get_m3u8_ts_url(opt.url.as_str(), "", &opt)?;
 
     download(
-        ts.iter().map(|f| f).collect::<Vec<&String>>().as_slice(),
+        ts,
         format!(
             "{}/{}",
             opt.dir,
@@ -157,7 +157,11 @@ fn run(opt: Opt) -> Result<(), String> {
     Ok(())
 }
 
-fn get_m3u8_ts_url(url: &str, uri: &str, opt: &Opt) -> Result<Vec<String>, String> {
+fn get_m3u8_ts_url(
+    url: &str,
+    uri: &str,
+    opt: &Opt,
+) -> Result<Vec<(Option<m3u8_rs::Key>, String)>, String> {
     let m3u8_url = url::Url::parse(url)
         .and_then(|f| f.join(uri))
         .map_err(|e| format!("m3u8 url not valid {}", e))?;
@@ -181,10 +185,15 @@ fn get_m3u8_ts_url(url: &str, uri: &str, opt: &Opt) -> Result<Vec<String>, Strin
                 return Ok(me
                     .segments
                     .iter()
-                    .map(|f| get_real_url(m3u8_url.as_str(), f.uri.as_str()))
-                    .filter(|f| f.is_ok())
-                    .map(|f| f.unwrap().to_string())
-                    .collect::<Vec<String>>());
+                    .map(|f| {
+                        (
+                            f.key.clone(),
+                            get_real_url(m3u8_url.as_str(), f.uri.as_str()),
+                        )
+                    })
+                    .filter(|f| f.1.is_ok())
+                    .map(|f| (f.0, f.1.unwrap().to_string()))
+                    .collect::<Vec<(Option<m3u8_rs::Key>, String)>>());
             }
             Err(e) => return Err(e.to_string()),
         }
@@ -192,8 +201,13 @@ fn get_m3u8_ts_url(url: &str, uri: &str, opt: &Opt) -> Result<Vec<String>, Strin
     Err(format!("resp error {} {}", resp.status_code, m3u8_url))
 }
 
-fn download(list: &[&String], dir: &str, out: &str, opt: &Opt) -> Result<(), String> {
-    std::fs::create_dir_all(dir).map_err(|e| format!("create dir = {}", e.to_string()))?;
+fn download(
+    list: Vec<(Option<m3u8_rs::Key>, String)>,
+    dir: &str,
+    out: &str,
+    opt: &Opt,
+) -> Result<(), String> {
+    std::fs::create_dir_all(dir).map_err(|e| format!("create dir = {}", e))?;
 
     let queue = std::sync::Arc::new(crossbeam::queue::SegQueue::new());
     let segment_count = list.len();
@@ -210,13 +224,18 @@ fn download(list: &[&String], dir: &str, out: &str, opt: &Opt) -> Result<(), Str
         for i in 0..opt.thread {
             let s = Arc::clone(&thread_queue);
             sc.spawn(move |_| {
-                while let Some((url, file)) = s.pop() {
+                while let Some(((key, url), file)) = s.pop() {
                     log::debug!("thread {i} {url}",);
                     let now = segment_count - s.len();
                     for i in 0..opt.retry {
-                        if let Err(e) =
-                            download_item(url.as_str(), file.as_str(), opt, now, segment_count)
-                        {
+                        if let Err(e) = download_item(
+                            &key,
+                            url.as_str(),
+                            file.as_str(),
+                            opt,
+                            now,
+                            segment_count,
+                        ) {
                             log::error!(
                                 "download file fail ={url}, reason =[{e}] after retry {i} count"
                             );
@@ -290,7 +309,14 @@ fn get_env_proxy(url: &str) -> Option<String> {
     .ok()
 }
 
-fn download_item(url: &str, path: &str, opt: &Opt, now: usize, total: usize) -> Result<(), String> {
+fn download_item(
+    key: &Option<m3u8_rs::Key>,
+    url: &str,
+    path: &str,
+    opt: &Opt,
+    now: usize,
+    total: usize,
+) -> Result<(), String> {
     if std::fs::exists(path).unwrap_or(false) {
         return Ok(());
     }
@@ -301,6 +327,7 @@ fn download_item(url: &str, path: &str, opt: &Opt, now: usize, total: usize) -> 
             let v = resp.as_bytes();
             if v.len() == len.parse::<usize>().map_err(|e| e.to_string())? {
                 log::info!("url = {url} path={path} {now}/{total}");
+                let v = decrypt(key, v, opt)?;
                 std::fs::write(path, &v[opt.skip..]).map_err(|e| e.to_string())?;
             } else {
                 return Err("len not eq".to_string());
@@ -312,13 +339,11 @@ fn download_item(url: &str, path: &str, opt: &Opt, now: usize, total: usize) -> 
         // 找到最近的下载成功的ts文件，就是上一个
         for i in (0..now - 1).rev() {
             let p = Path::system(path).pop().join(format!("{i}.ts").as_str());
-            if std::fs::exists(p.to_string().as_str()).unwrap_or(false) {
-                if let Ok(_) = std::fs::copy(p.to_string().as_str(), path) {
-                    log::info!(
-                        "file {path} not found, use the file [{}] replace it",
-                        p.to_string()
-                    );
-                };
+            if std::fs::exists(p.to_string().as_str()).unwrap_or(false) && std::fs::copy(p.to_string().as_str(), path).is_ok() {
+                log::info!(
+                    "file {path} not found, use the file [{}] replace it",
+                    p.to_string()
+                );
             }
         }
     } else {
@@ -329,6 +354,117 @@ fn download_item(url: &str, path: &str, opt: &Opt, now: usize, total: usize) -> 
     }
 
     Ok(())
+}
+
+fn hex_string_to_bytes(hex_string: &str) -> Option<Vec<u8>> {
+    let mut bytes = Vec::new();
+    let mut chars = hex_string.chars().peekable();
+
+    while let Some(c1) = chars.next() {
+        if let Some(c2) = chars.next() {
+            let byte = match u8::from_str_radix(&format!("{}{}", c1, c2), 16) {
+                Ok(byte) => byte,
+                Err(_) => {
+                    log::warn!("decrypt fail, not valid iv");
+                    return None;
+                }
+            };
+            bytes.push(byte);
+        } else {
+            log::warn!("decrypt fail, not valid iv");
+            return None;
+        }
+    }
+
+    Some(bytes)
+}
+
+use crypto::aes;
+use crypto::blockmodes::PkcsPadding;
+use crypto::buffer::{ReadBuffer, RefReadBuffer, RefWriteBuffer, WriteBuffer};
+use crypto::symmetriccipher::SymmetricCipherError;
+
+/// Decrypt a buffer with the given key and iv using AES128/CBC/Pkcs encryption.
+/// 解密(data:加密数据；key：密钥（长度为16的字符串）；iv：偏移量（长度为16的字符串）)
+fn aes128_cbc_decrypt(
+    data: &[u8],
+    key: &[u8; 16],
+    iv: &[u8; 16],
+) -> Result<Vec<u8>, SymmetricCipherError> {
+    let mut decryptor = aes::cbc_decryptor(aes::KeySize::KeySize128, key, iv, PkcsPadding);
+
+    let mut buffer = [0; 4096];
+    let mut write_buffer = RefWriteBuffer::new(&mut buffer);
+    let mut read_buffer = RefReadBuffer::new(data);
+    let mut final_result = Vec::new();
+
+    loop {
+        let result = decryptor.decrypt(&mut read_buffer, &mut write_buffer, true)?;
+        final_result.extend(
+            write_buffer
+                .take_read_buffer()
+                .take_remaining()
+                .iter().copied(),
+        );
+        match result {
+            crypto::buffer::BufferResult::BufferUnderflow => break,
+            _ => continue,
+        }
+    }
+
+    Ok(final_result)
+}
+
+fn decrypt<'a>(
+    key: &'a Option<m3u8_rs::Key>,
+    value: &'a [u8],
+    opt: &Opt,
+) -> Result<Vec<u8>, String> {
+    if let Some(key) = key {
+        match &key.method {
+            m3u8_rs::KeyMethod::None => return Ok(value.to_vec()),
+            m3u8_rs::KeyMethod::SampleAES => {
+                return Err("unsupport decrypt method SampleAES".to_string())
+            }
+            m3u8_rs::KeyMethod::Other(v) => return Err(format!("unsupport decrypt method {v}")),
+            m3u8_rs::KeyMethod::AES128 => {
+                log::info!("start decrypt");
+                // key.
+                // use aes::cipher::{
+                //     generic_array::GenericArray, BlockCipher, BlockDecrypt, BlockEncrypt, KeyInit,
+                // };
+                // use aes::Aes128;
+                if let Some(iv) = key
+                    .iv
+                    .as_ref()
+                    .map(|f| f.replace("0x", ""))
+                    .and_then(|f| hex_string_to_bytes(f.as_str()))
+                {
+                    // 获取key
+                    if let Some(v) = key
+                        .uri
+                        .as_ref()
+                        .and_then(|f| download_inner(f.as_str(), opt).ok())
+                    {
+                        let k: [u8; 16] = v
+                            .as_bytes()
+                            .try_into()
+                            .map_err(|f| format!("decrypt e {f}"))?;
+
+                        return aes128_cbc_decrypt(
+                            value,
+                            &k,
+                            &iv.try_into().map_err(|f| format!("decrypt e {:?}", f))?,
+                        )
+                        .map_err(|f| format!("decrypt fail {:?}", f));
+                    }
+                    return Err("decrypt fail, reason: get the aes key fail".to_string());
+                }
+                return Err("decrypt fail, reason: get the aes iv fail".to_string());
+            }
+        }
+    }
+    Ok(value.to_vec())
 }
 
 fn concat(files: Vec<String>, out: &str, opt: &Opt) -> Result<(), String> {
@@ -358,7 +494,7 @@ fn concat(files: Vec<String>, out: &str, opt: &Opt) -> Result<(), String> {
         .stderr(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .spawn()
-        .map_err(|e| format!("exec ffmpeg e ={}", e.to_string()))?;
+        .map_err(|e| format!("exec ffmpeg e ={}", e))?;
     let mut s = c
         .wait_with_output()
         .map_err(|e| format!("ffmpeg exec error = {e}"))?;
