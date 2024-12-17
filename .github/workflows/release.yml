@@ -38,6 +38,8 @@ jobs:
         with:
           toolchain: ${{ env.RUST_VERSION }}
       - name: Build
+        env:
+          RUSTFLAGS: "-C target-feature=+crt-static"
         run: |
           cargo build --release
       - name: Upload artifacts
