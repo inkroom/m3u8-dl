@@ -14,7 +14,7 @@ struct Opt {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[arg(long, help = "使用指定uid运行程序(unavailable for window)")]
     uid: Option<u32>,
-    #[arg(short,long, default_value = "4", help = "线程数量")]
+    #[arg(short, long, default_value = "4", help = "线程数量")]
     thread: u32,
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[arg(
@@ -80,6 +80,8 @@ fn main() {
             let pid = libc::fork();
             if pid > 0 {
                 // println!("父进程结束 {}", std::process::id());
+                log::info!("the download task will continue on daemon");
+                return;
             } else if pid == 0 {
                 libc::setsid();
                 let _ = libc::close(0);
@@ -103,17 +105,18 @@ fn main() {
                         std::process::exit(101);
                     }
                 }
+                return;
             } else {
                 log::error!("fork 失败");
+                return;
             }
         }
-    } else {
-        match run(opt) {
-            Ok(_) => {}
-            Err(e) => {
-                log::error!("{e}");
-                std::process::exit(101);
-            }
+    }
+    match run(opt) {
+        Ok(_) => {}
+        Err(e) => {
+            log::error!("{e}");
+            std::process::exit(101);
         }
     }
 }
