@@ -1,11 +1,17 @@
+use std::fmt::Debug;
+use std::time::SystemTime;
 use std::{ffi::CString, sync::Arc};
 
 use clap::Parser;
 use crypto::digest::Digest;
+use log::LevelFilter;
+use log4rs::append::console::ConsoleAppender;
+use log4rs::append::file::FileAppender;
+use log4rs::config::Logger;
 use m3u8_rs::Playlist;
 
-#[derive(Parser, Debug)]
-struct Opt {
+#[derive(Parser)]
+pub struct Opt {
     #[arg(short, long = "url", help = "m3u8地址")]
     url: String,
     #[arg(short, long = "dir", help = "输出文件夹")]
@@ -46,35 +52,154 @@ struct Opt {
     #[arg(
         long,
         help = "处理404",
-        long_help = "当ts返回404时，使用最近的已下载的ts替换",
+        long_help = "当ts返回404时，使用最近的已下载的ts替换；如果启用多线程可能会导致替换失败或者源文件过于靠前",
         default_value = "false"
     )]
     replace_not_found: bool,
     #[arg(short, long, default_value = "false", help = "输出更多日志")]
     verbose: bool,
+
+    #[arg(skip)]
+    client: Option<Box<dyn HttpClient + Send + Sync>>,
+    #[arg(skip)]
+    begin: Option<std::time::SystemTime>,
+}
+
+impl Debug for Opt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Opt")
+            .field("url", &self.url.as_str())
+            .finish()
+    }
+}
+
+pub trait HttpClient: Send {
+    fn init(opt: &Opt) -> Result<Self, String>
+    where
+        Self: Sized;
+
+    fn get(&self, url: &str) -> Result<Vec<u8>, (String, u16)>;
+}
+
+#[cfg(feature = "ureq")]
+mod ureqclient {
+    use crate::{HttpClient, Opt};
+
+    pub(crate) struct UReqClient {
+        inner: ureq::Agent,
+    }
+
+    impl HttpClient for UReqClient {
+        fn init(opt: &Opt) -> Result<Self, std::string::String> {
+            let mut bu = ureq::AgentBuilder::new();
+            if !opt.no_proxy {
+                if let Some(proxy) = &opt.proxy {
+                    log::debug!("use proxy = {}", proxy);
+                    bu = bu.proxy(
+                        ureq::Proxy::new(proxy).map_err(|e| format!("unvalid proxy {}", proxy))?,
+                    );
+                } else {
+                    log::debug!("use env proxy");
+                    bu = bu.try_proxy_from_env(true);
+                }
+            } else {
+                log::debug!("no proxy");
+                bu = bu.try_proxy_from_env(false);
+            }
+            Ok(UReqClient { inner: bu.build() })
+        }
+
+        fn get(&self, url: &str) -> Result<Vec<u8>, (String, u16)> {
+            let v = self.inner.get(url).call().map_err(|e| {
+                (
+                    format!("request error ={}", e),
+                    e.into_response().map(|f| f.status()).unwrap_or(0),
+                )
+            })?;
+            if v.status() == 200 {
+                println!("{:?}", v.headers_names());
+                // let len: usize = match v.header("content-length").and_then(|f| f.parse().ok()) {
+                //     Some(v) => v,
+                //     None => return Err(("request no content-length".to_string(), v.status())),
+                // };
+                // TODO 这里会吃掉一些响应头，很奇怪
+                let mut bytes: Vec<u8> = Vec::new();
+                v.into_reader()
+                    .read_to_end(&mut bytes)
+                    .map_err(|e| (format!("reqeust fail , reason = [{}]", e), 200))?;
+                return Ok(bytes);
+            }
+            Err((
+                format!("request fail, reason = [{}]", v.status_text()),
+                v.status(),
+            ))
+        }
+    }
+}
+#[cfg(feature = "west")]
+mod reqwestclient {
+    use crate::HttpClient;
+
+    pub struct ReqWestClient {
+        inner: reqwest::blocking::Client,
+    }
+
+    impl HttpClient for ReqWestClient {
+        fn init(opt: &crate::Opt) -> Result<Self, String>
+        where
+            Self: Sized,
+        {
+            let mut c = reqwest::blocking::Client::builder();
+            if !opt.no_proxy {
+                if let Some(proxy) = &opt.proxy {
+                    log::debug!("use proxy = {}", proxy);
+                    c = c.no_proxy().proxy(
+                        reqwest::Proxy::all(proxy)
+                            .expect(format!("unvalid proxy = {}", proxy).as_str()),
+                    );
+                } else {
+                    log::debug!("will use the env proxy config");
+                    // log::info!("use proxy ={proxy}");
+                    // c = c.proxy(reqwest::Proxy::all(proxy_scheme))
+                }
+            } else {
+                log::debug!("no proxy");
+                c = c.no_proxy();
+            }
+            c.build()
+                .map(|f| ReqWestClient { inner: f })
+                .map_err(|f| format!("init fail {f}"))
+        }
+
+        fn get(&self, url: &str) -> Result<Vec<u8>, (String, u16)> {
+            match self.inner.get(url).send().map_err(|e| e.to_string()) {
+                Ok(v) => {
+                    if v.status().is_success() {
+                        v.bytes()
+                            .map(|f| f.to_vec())
+                            .map_err(|f| format!("request {url} fail , reason:{}", f))
+                    } else {
+                        Err((
+                            format!("request {url} fail, reason: {}", v.status().as_u16()),
+                            v.status().as_u16(),
+                        ))
+                    }
+                }
+                Err(e) => Err((e, 0)),
+            }
+        }
+    }
 }
 
 fn main() {
     let mut opt = Opt::parse();
 
-    // println!("{:?}", opt);
-    let s = simple_log::LogConfigBuilder::builder()
-        .level(if opt.verbose {
-            "debug,rustls=info"
-        } else {
-            "info"
-        })
-        .unwrap()
-        .time_format("%Y-%m-%d %H:%M:%S.%f")
-        .output_console();
-
-    if let Some(log) = &opt.log {
-        simple_log::new(s.path(log).output_file().build()).expect("log init error");
-    } else {
-        simple_log::new(s.build()).expect("log init error");
+    if let Err(e) = opt.init() {
+        log::error!("{e}");
+        std::process::exit(101);
     }
-
     log::info!("参数={:?}", opt);
+
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     if opt.daemon {
         unsafe {
@@ -184,6 +309,71 @@ fn aes128_cbc_decrypt(
 }
 
 impl Opt {
+    fn log(&self) {
+        let pattern = "{d(%Y-%m-%d %H:%M:%S)} : {m}{n}";
+
+        let mut s = log4rs::Config::builder()
+            .appender(
+                log4rs::config::Appender::builder().build(
+                    "stdout",
+                    Box::new(
+                        ConsoleAppender::builder()
+                            .encoder(Box::new(log4rs::encode::pattern::PatternEncoder::new(
+                                pattern,
+                            )))
+                            .build(),
+                    ),
+                ),
+            )
+            .logger(Logger::builder().build("rustls", LevelFilter::Off));
+
+        if let Some(log) = &self.log {
+            s = s.appender(
+                log4rs::config::Appender::builder().build(
+                    "file",
+                    Box::new(
+                        FileAppender::builder()
+                            .encoder(Box::new(log4rs::encode::pattern::PatternEncoder::new(
+                                pattern,
+                            )))
+                            .build(log)
+                            .unwrap(),
+                    ),
+                ),
+            );
+        }
+        log4rs::init_config(
+            s.build(
+                log4rs::config::Root::builder()
+                    .appender("stdout")
+                    .appender("file")
+                    .build(if self.verbose {
+                        LevelFilter::Debug
+                    } else {
+                        LevelFilter::Info
+                    }),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn init(&mut self) -> Result<(), String> {
+        self.log();
+
+        #[cfg(feature = "ureq")]
+        {
+            self.client = Some(Box::new(ureqclient::UReqClient::init(&self)?));
+        }
+        #[cfg(feature = "west")]
+        {
+            self.client = Some(Box::new(reqwestclient::ReqWestClient::init(&self)?));
+        }
+
+        self.begin = Some(SystemTime::now());
+        Ok(())
+    }
+
     fn run(&mut self) -> Result<(), String> {
         #[cfg(any(target_os = "macos", target_os = "linux"))]
         if let Some(uid) = self.uid {
@@ -215,7 +405,14 @@ impl Opt {
             out.as_str(),
         )?;
 
-        log::info!("下载完成 {} ", self.url);
+        log::info!(
+            "下载完成 {} 耗时 ={}秒",
+            self.url,
+            SystemTime::now()
+                .duration_since(self.begin.clone().unwrap())
+                .unwrap()
+                .as_secs()
+        );
         Ok(())
     }
 
@@ -229,38 +426,41 @@ impl Opt {
             .map_err(|e| format!("m3u8 url not valid {}", e))?;
         log::info!("downloading m3u8 {}", m3u8_url);
 
-        let resp = self.download_inner(m3u8_url.as_str())?;
-        if resp.status_code == 200 {
-            match m3u8_rs::parse_playlist_res(resp.as_bytes()) {
-                Ok(Playlist::MasterPlaylist(m)) => {
-                    let mut v = Vec::new();
-                    for ele in &m.variants {
-                        v.append(&mut self.get_m3u8_ts_url(m3u8_url.as_str(), ele.uri.as_str())?);
+        match self.download_inner(m3u8_url.as_str()) {
+            Ok(v) => {
+                match m3u8_rs::parse_playlist_res(v.as_ref()) {
+                    Ok(Playlist::MasterPlaylist(m)) => {
+                        let mut v = Vec::new();
+                        for ele in &m.variants {
+                            v.append(
+                                &mut self.get_m3u8_ts_url(m3u8_url.as_str(), ele.uri.as_str())?,
+                            );
+                        }
+                        return Ok(v);
                     }
-                    return Ok(v);
-                }
-                Ok(Playlist::MediaPlaylist(me)) => {
-                    // 如果有需要解密的key，这个key只会出现在第0个ts上，但是每个ts都需要用
+                    Ok(Playlist::MediaPlaylist(me)) => {
+                        // 如果有需要解密的key，这个key只会出现在第0个ts上，但是每个ts都需要用
 
-                    let key = me.segments[0].key.clone();
+                        let key = me.segments[0].key.clone();
 
-                    return Ok(me
-                        .segments
-                        .iter()
-                        .map(|f| {
-                            (
-                                key.clone(),
-                                Self::get_real_url(m3u8_url.as_str(), f.uri.as_str()),
-                            )
-                        })
-                        .filter(|f| f.1.is_ok())
-                        .map(|f| (f.0, f.1.unwrap().to_string()))
-                        .collect::<Vec<(Option<m3u8_rs::Key>, String)>>());
+                        return Ok(me
+                            .segments
+                            .iter()
+                            .map(|f| {
+                                (
+                                    key.clone(),
+                                    Self::get_real_url(m3u8_url.as_str(), f.uri.as_str()),
+                                )
+                            })
+                            .filter(|f| f.1.is_ok())
+                            .map(|f| (f.0, f.1.unwrap().to_string()))
+                            .collect::<Vec<(Option<m3u8_rs::Key>, String)>>());
+                    }
+                    Err(e) => return Err(e.to_string()),
                 }
-                Err(e) => return Err(e.to_string()),
             }
+            Err((e, status)) => Err(format!("resp error {} {} {e}", status, m3u8_url)),
         }
-        Err(format!("resp error {} {}", resp.status_code, m3u8_url))
     }
 
     fn download(
@@ -340,36 +540,11 @@ impl Opt {
         }
     }
 
-    fn download_inner(&self, url: &str) -> Result<minreq::Response, String> {
-        let mut req = minreq::get(url);
-        if !self.no_proxy {
-            if let Some(proxy) = &self.proxy {
-                req = req.with_proxy(
-                    minreq::Proxy::new(proxy).map_err(|e| format!("proxy not valid {e}"))?,
-                );
-            } else if let Some(proxy) = Self::get_env_proxy(url) {
-                log::info!("use proxy ={proxy}");
-                req = req.with_proxy(
-                    minreq::Proxy::new(proxy).map_err(|e| format!("proxy not valid {e}"))?,
-                );
-            }
+    fn download_inner(&self, url: &str) -> Result<Vec<u8>, (String, u16)> {
+        match &self.client {
+            Some(c) => c.get(url),
+            None => unreachable!(),
         }
-        req.send().map_err(|e| e.to_string())
-    }
-
-    fn get_env_proxy(url: &str) -> Option<String> {
-        if url.starts_with("https") {
-            std::env::var("HTTPS_PROXY")
-                .or_else(|_| std::env::var("https_proxy"))
-                .or_else(|_| std::env::var("ALL_PROXY"))
-                .or_else(|_| std::env::var("all_proxy"))
-        } else {
-            std::env::var("HTTP_PROXY")
-                .or_else(|_| std::env::var("http_proxy"))
-                .or_else(|_| std::env::var("ALL_PROXY"))
-                .or_else(|_| std::env::var("all_proxy"))
-        }
-        .ok()
     }
 
     fn download_item(
@@ -384,39 +559,33 @@ impl Opt {
         if std::fs::exists(path).unwrap_or(false) {
             return Ok(());
         }
-
-        let resp = self.download_inner(url)?;
-        if resp.status_code == 200 {
-            if let Some(len) = resp.headers.get("content-length") {
-                let v = resp.as_bytes();
-                if v.len() == len.parse::<usize>().map_err(|e| e.to_string())? {
-                    log::info!("url = {url} path={path} {now}/{total}");
-                    let v = self.decrypt(key, v, dir)?;
-                    std::fs::write(path, &v[self.skip..]).map_err(|e| e.to_string())?;
+        match self.download_inner(url) {
+            Ok(v) => {
+                log::info!("url = {url} path={path} {now}/{total}");
+                let v = self.decrypt(key, &v, dir)?;
+                std::fs::write(path, &v[self.skip..]).map_err(|e| e.to_string())?;
+            }
+            Err((e, status)) => {
+                if status == 404 && self.replace_not_found {
+                    // 找到最近的下载成功的ts文件，就是上一个
+                    for i in (0..now - 1).rev() {
+                        let p = Path::system(path).pop().join(format!("{i}.ts").as_str());
+                        if std::fs::exists(p.to_string().as_str()).unwrap_or(false)
+                            && std::fs::copy(p.to_string().as_str(), path).is_ok()
+                        {
+                            log::info!(
+                                "file {path} not found, use the file [{}] replace it",
+                                p.to_string()
+                            );
+                        }
+                    }
                 } else {
-                    return Err("len not eq".to_string());
-                }
-            } else {
-                return Err("no cotent-length".to_string());
-            }
-        } else if resp.status_code == 404 && self.replace_not_found {
-            // 找到最近的下载成功的ts文件，就是上一个
-            for i in (0..now - 1).rev() {
-                let p = Path::system(path).pop().join(format!("{i}.ts").as_str());
-                if std::fs::exists(p.to_string().as_str()).unwrap_or(false)
-                    && std::fs::copy(p.to_string().as_str(), path).is_ok()
-                {
-                    log::info!(
-                        "file {path} not found, use the file [{}] replace it",
-                        p.to_string()
-                    );
+                    return Err(format!(
+                        "down file {url} fail, because the server return {}-{}",
+                        e, status
+                    ));
                 }
             }
-        } else {
-            return Err(format!(
-                "down file {url} fail, because the server return {}",
-                resp.status_code
-            ));
         }
 
         Ok(())
@@ -461,8 +630,8 @@ impl Opt {
                                         log::debug!("download the key file from uri = {uri}");
                                         // 读取uri
                                         self.download_inner(uri).map(|f| {
-                                            let _ = std::fs::write(path.as_str(), f.as_bytes());
-                                            f.as_bytes().to_vec()
+                                            let _ = std::fs::write(path.as_str(), f.as_slice());
+                                            f.to_vec()
                                         })
                                     })
                                     .ok()
@@ -616,5 +785,64 @@ mod tests {
                 .unwrap();
         println!("{v}");
         println!("{}", v.join("").unwrap());
+    }
+
+    #[test]
+    fn log() {
+        let pattern = "{d(%Y-%m-%d %H:%M:%S)} : {m}{n}";
+        let mut s = log4rs::Config::builder()
+            .appender(
+                log4rs::config::Appender::builder().build(
+                    "stdout",
+                    Box::new(
+                        log4rs::append::console::ConsoleAppender::builder()
+                            .encoder(Box::new(log4rs::encode::pattern::PatternEncoder::new(
+                                pattern,
+                            )))
+                            .build(),
+                    ),
+                ),
+            )
+            .logger(log4rs::config::Logger::builder().build("rustls", log::LevelFilter::Off));
+
+        // // println!("{:?}", opt);
+        // let s = simple_log::LogConfigBuilder::builder()
+        //     .level(if opt.verbose {
+        //         "debug,rustls=info"
+        //     } else {
+        //         "info"
+        //     })
+        //     .unwrap()
+        //     .time_format("%Y-%m-%d %H:%M:%S")
+        //     .output_console();
+
+        // if let Some(log) = &opt.log {
+        s = s.appender(
+            log4rs::config::Appender::builder().build(
+                "file",
+                Box::new(
+                    log4rs::append::file::FileAppender::builder()
+                        .encoder(Box::new(log4rs::encode::pattern::PatternEncoder::new(
+                            pattern,
+                        )))
+                        .build("55.log")
+                        .unwrap(),
+                ),
+            ),
+        );
+        // }
+
+        log4rs::init_config(
+            s.build(
+                log4rs::config::Root::builder()
+                    .appender("stdout")
+                    .appender("file")
+                    .build(log::LevelFilter::Debug),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        log::info!("参数=");
     }
 }
