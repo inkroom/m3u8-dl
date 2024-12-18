@@ -55,7 +55,7 @@ struct Opt {
 }
 
 fn main() {
-    let opt = Opt::parse();
+    let mut opt = Opt::parse();
 
     // println!("{:?}", opt);
     let s = simple_log::LogConfigBuilder::builder()
@@ -99,7 +99,7 @@ fn main() {
                 libc::dup2(null_fd, libc::STDOUT_FILENO);
                 libc::dup2(null_fd, libc::STDERR_FILENO);
 
-                match run(opt) {
+                match opt.run() {
                     Ok(_) => {}
                     Err(e) => {
                         log::error!("{e}");
@@ -113,256 +113,13 @@ fn main() {
             }
         }
     }
-    match run(opt) {
+    match opt.run() {
         Ok(_) => {}
         Err(e) => {
             log::error!("{e}");
             std::process::exit(101);
         }
     }
-}
-
-fn run(opt: Opt) -> Result<(), String> {
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    if let Some(uid) = opt.uid {
-        unsafe {
-            let _ = libc::setuid(uid);
-            let _ = libc::setgid(uid);
-        }
-    }
-    if !opt.name.as_str().ends_with(".mp4") && !opt.name.as_str().ends_with(".mkv") {
-        return Err("name 必须有文件格式".to_string());
-    }
-
-    let out = format!("{}/{}", opt.dir, opt.name);
-    if std::fs::exists(out.as_str()).unwrap_or(false) {
-        log::info!("the out file exists = [{out}] ");
-        return Ok(());
-    }
-
-    let ts = get_m3u8_ts_url(opt.url.as_str(), "", &opt)?;
-
-    download(
-        ts,
-        format!(
-            "{}/{}",
-            opt.dir,
-            opt.name.replace(".mp4", "").replace(".mkv", "")
-        )
-        .as_str(),
-        out.as_str(),
-        &opt,
-    )?;
-
-    log::info!("下载完成 {} ", opt.url);
-    Ok(())
-}
-
-fn get_m3u8_ts_url(
-    url: &str,
-    uri: &str,
-    opt: &Opt,
-) -> Result<Vec<(Option<m3u8_rs::Key>, String)>, String> {
-    let m3u8_url = url::Url::parse(url)
-        .and_then(|f| f.join(uri))
-        .map_err(|e| format!("m3u8 url not valid {}", e))?;
-    log::info!("downloading m3u8 {}", m3u8_url);
-
-    let resp = download_inner(m3u8_url.as_str(), opt)?;
-    if resp.status_code == 200 {
-        match m3u8_rs::parse_playlist_res(resp.as_bytes()) {
-            Ok(Playlist::MasterPlaylist(m)) => {
-                let mut v = Vec::new();
-                for ele in &m.variants {
-                    v.append(&mut get_m3u8_ts_url(
-                        m3u8_url.as_str(),
-                        ele.uri.as_str(),
-                        opt,
-                    )?);
-                }
-                return Ok(v);
-            }
-            Ok(Playlist::MediaPlaylist(me)) => {
-                // 如果有需要解密的key，这个key只会出现在第0个ts上，但是每个ts都需要用
-
-                let key = me.segments[0].key.clone();
-
-                return Ok(me
-                    .segments
-                    .iter()
-                    .map(|f| {
-                        (
-                            key.clone(),
-                            get_real_url(m3u8_url.as_str(), f.uri.as_str()),
-                        )
-                    })
-                    .filter(|f| f.1.is_ok())
-                    .map(|f| (f.0, f.1.unwrap().to_string()))
-                    .collect::<Vec<(Option<m3u8_rs::Key>, String)>>());
-            }
-            Err(e) => return Err(e.to_string()),
-        }
-    }
-    Err(format!("resp error {} {}", resp.status_code, m3u8_url))
-}
-
-fn download(
-    list: Vec<(Option<m3u8_rs::Key>, String)>,
-    dir: &str,
-    out: &str,
-    opt: &Opt,
-) -> Result<(), String> {
-    std::fs::create_dir_all(dir).map_err(|e| format!("create dir = {}", e))?;
-
-    let queue = std::sync::Arc::new(crossbeam::queue::SegQueue::new());
-    let segment_count = list.len();
-    for (index, ele) in list.iter().enumerate() {
-        // ele.uri
-        // println!("{}", ele.uri);
-        // let v = get_real_url(m3u8, ele.as_str())?;
-        let v = ele;
-        queue.push((v.clone(), format!("{dir}/{}.ts", index)));
-    }
-    let thread_queue = Arc::clone(&queue);
-    // 消费
-    crossbeam::scope(|sc| {
-        for i in 0..opt.thread {
-            let s = Arc::clone(&thread_queue);
-            sc.spawn(move |_| {
-                while let Some(((key, url), file)) = s.pop() {
-                    log::debug!("thread {i} {url}",);
-                    let now = segment_count - s.len();
-                    for i in 0..opt.retry {
-                        if let Err(e) = download_item(
-                            &key,
-                            url.as_str(),
-                            file.as_str(),
-                            dir,
-                            opt,
-                            now,
-                            segment_count,
-                        ) {
-                            log::error!(
-                                "download file fail ={url}, reason =[{e}] after retry {i} count"
-                            );
-                        } else {
-                            // 成功
-                            break;
-                        }
-                    }
-                }
-            });
-        }
-    })
-    .unwrap();
-
-    // 等待
-    loop {
-        if queue.is_empty() {
-            log::info!("完成");
-            break;
-        }
-    }
-
-    concat(
-        list.iter()
-            .enumerate()
-            .map(|(index, _)| format!("{dir}/{index}.ts"))
-            .collect::<Vec<String>>(),
-        out,
-        opt,
-    )
-}
-
-fn get_real_url(m3u8: &str, uri: &str) -> Result<String, String> {
-    if uri.starts_with("http") {
-        Ok(uri.to_string())
-    } else {
-        let url = url::Url::parse(m3u8).map_err(|e| e.to_string())?;
-
-        url.join(uri)
-            .map_or_else(|e| Err(e.to_string()), |f| Ok(f.as_str().to_string()))
-    }
-}
-
-fn download_inner(url: &str, opt: &Opt) -> Result<minreq::Response, String> {
-    let mut req = minreq::get(url);
-    if !opt.no_proxy {
-        if let Some(proxy) = &opt.proxy {
-            req = req
-                .with_proxy(minreq::Proxy::new(proxy).map_err(|e| format!("proxy not valid {e}"))?);
-        } else if let Some(proxy) = get_env_proxy(url) {
-            log::info!("use proxy ={proxy}");
-            req = req
-                .with_proxy(minreq::Proxy::new(proxy).map_err(|e| format!("proxy not valid {e}"))?);
-        }
-    }
-    req.send().map_err(|e| e.to_string())
-}
-
-fn get_env_proxy(url: &str) -> Option<String> {
-    if url.starts_with("https") {
-        std::env::var("HTTPS_PROXY")
-            .or_else(|_| std::env::var("https_proxy"))
-            .or_else(|_| std::env::var("ALL_PROXY"))
-            .or_else(|_| std::env::var("all_proxy"))
-    } else {
-        std::env::var("HTTP_PROXY")
-            .or_else(|_| std::env::var("http_proxy"))
-            .or_else(|_| std::env::var("ALL_PROXY"))
-            .or_else(|_| std::env::var("all_proxy"))
-    }
-    .ok()
-}
-
-fn download_item(
-    key: &Option<m3u8_rs::Key>,
-    url: &str,
-    path: &str,
-    dir: &str,
-    opt: &Opt,
-    now: usize,
-    total: usize,
-) -> Result<(), String> {
-    if std::fs::exists(path).unwrap_or(false) {
-        return Ok(());
-    }
-
-    let resp = download_inner(url, opt)?;
-    if resp.status_code == 200 {
-        if let Some(len) = resp.headers.get("content-length") {
-            let v = resp.as_bytes();
-            if v.len() == len.parse::<usize>().map_err(|e| e.to_string())? {
-                log::info!("url = {url} path={path} {now}/{total}");
-                let v = decrypt(key, v, dir, opt)?;
-                std::fs::write(path, &v[opt.skip..]).map_err(|e| e.to_string())?;
-            } else {
-                return Err("len not eq".to_string());
-            }
-        } else {
-            return Err("no cotent-length".to_string());
-        }
-    } else if resp.status_code == 404 && opt.replace_not_found {
-        // 找到最近的下载成功的ts文件，就是上一个
-        for i in (0..now - 1).rev() {
-            let p = Path::system(path).pop().join(format!("{i}.ts").as_str());
-            if std::fs::exists(p.to_string().as_str()).unwrap_or(false)
-                && std::fs::copy(p.to_string().as_str(), path).is_ok()
-            {
-                log::info!(
-                    "file {path} not found, use the file [{}] replace it",
-                    p.to_string()
-                );
-            }
-        }
-    } else {
-        return Err(format!(
-            "down file {url} fail, because the server return {}",
-            resp.status_code
-        ));
-    }
-
-    Ok(())
 }
 
 fn hex_string_to_bytes(hex_string: &str) -> Option<Vec<u8>> {
@@ -426,123 +183,364 @@ fn aes128_cbc_decrypt(
     Ok(final_result)
 }
 
-fn decrypt<'a>(
-    key: &Option<m3u8_rs::Key>,
-    value: &[u8],
-    dir: &str,
-    opt: &Opt,
-) -> Result<Vec<u8>, String> {
-    if let Some(key) = key {
-        match &key.method {
-            m3u8_rs::KeyMethod::None => return Ok(value.to_vec()),
-            m3u8_rs::KeyMethod::SampleAES => {
-                return Err("unsupport decrypt method SampleAES".to_string())
-            }
-            m3u8_rs::KeyMethod::Other(v) => return Err(format!("unsupport decrypt method {v}")),
-            m3u8_rs::KeyMethod::AES128 => {
-                log::info!("start decrypt");
-                if let Some(iv) = key
-                    .iv
-                    .as_ref()
-                    .map(|f| f.replace("0x", ""))
-                    .and_then(|f| hex_string_to_bytes(f.as_str()))
-                {
-                    let v: Option<[u8; 16]> = key
-                        .uri
-                        .as_ref()
-                        .map(|f| {
-                            let mut hash = crypto::md5::Md5::new();
-                            hash.input_str(f.as_str());
-
-                            (format!("{dir}/{}.key", hash.result_str()), f.as_str())
-                        })
-                        .and_then(|(path, uri)| {
-                            log::debug!("read the aes key from file {path}");
-                            std::fs::read(path.as_str())
-                                .or_else(|_| {
-                                    log::debug!("download the key file from uri = {uri}");
-                                    // 读取uri
-                                    download_inner(uri, opt).map(|f| {
-                                        let _ = std::fs::write(path.as_str(), f.as_bytes());
-                                        f.as_bytes().to_vec()
-                                    })
-                                })
-                                .ok()
-                        })
-                        .and_then(|f| f.try_into().ok());
-
-                    // 获取key
-                    if let Some(v) = v {
-                        return aes128_cbc_decrypt(
-                            value,
-                            &v,
-                            &iv.try_into().map_err(|f| format!("decrypt e {:?}", f))?,
-                        )
-                        .map_err(|f| format!("decrypt fail {:?}", f));
-                    }
-                    return Err("decrypt fail, reason: get the aes key fail".to_string());
-                }
-                return Err("decrypt fail, reason: get the aes iv fail".to_string());
+impl Opt {
+    fn run(&mut self) -> Result<(), String> {
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        if let Some(uid) = self.uid {
+            unsafe {
+                let _ = libc::setuid(uid);
+                let _ = libc::setgid(uid);
             }
         }
+        if !self.name.as_str().ends_with(".mp4") && !self.name.as_str().ends_with(".mkv") {
+            return Err("name 必须有文件格式".to_string());
+        }
+
+        let out = format!("{}/{}", self.dir, self.name);
+        if std::fs::exists(out.as_str()).unwrap_or(false) {
+            log::info!("the out file exists = [{out}] ");
+            return Ok(());
+        }
+
+        let ts = self.get_m3u8_ts_url(self.url.as_str(), "")?;
+
+        self.download(
+            ts,
+            format!(
+                "{}/{}",
+                self.dir,
+                self.name.replace(".mp4", "").replace(".mkv", "")
+            )
+            .as_str(),
+            out.as_str(),
+        )?;
+
+        log::info!("下载完成 {} ", self.url);
+        Ok(())
     }
-    Ok(value.to_vec())
+
+    fn get_m3u8_ts_url(
+        &self,
+        url: &str,
+        uri: &str,
+    ) -> Result<Vec<(Option<m3u8_rs::Key>, String)>, String> {
+        let m3u8_url = url::Url::parse(url)
+            .and_then(|f| f.join(uri))
+            .map_err(|e| format!("m3u8 url not valid {}", e))?;
+        log::info!("downloading m3u8 {}", m3u8_url);
+
+        let resp = self.download_inner(m3u8_url.as_str())?;
+        if resp.status_code == 200 {
+            match m3u8_rs::parse_playlist_res(resp.as_bytes()) {
+                Ok(Playlist::MasterPlaylist(m)) => {
+                    let mut v = Vec::new();
+                    for ele in &m.variants {
+                        v.append(&mut self.get_m3u8_ts_url(m3u8_url.as_str(), ele.uri.as_str())?);
+                    }
+                    return Ok(v);
+                }
+                Ok(Playlist::MediaPlaylist(me)) => {
+                    // 如果有需要解密的key，这个key只会出现在第0个ts上，但是每个ts都需要用
+
+                    let key = me.segments[0].key.clone();
+
+                    return Ok(me
+                        .segments
+                        .iter()
+                        .map(|f| {
+                            (
+                                key.clone(),
+                                Self::get_real_url(m3u8_url.as_str(), f.uri.as_str()),
+                            )
+                        })
+                        .filter(|f| f.1.is_ok())
+                        .map(|f| (f.0, f.1.unwrap().to_string()))
+                        .collect::<Vec<(Option<m3u8_rs::Key>, String)>>());
+                }
+                Err(e) => return Err(e.to_string()),
+            }
+        }
+        Err(format!("resp error {} {}", resp.status_code, m3u8_url))
+    }
+
+    fn download(
+        &self,
+        list: Vec<(Option<m3u8_rs::Key>, String)>,
+        dir: &str,
+        out: &str,
+    ) -> Result<(), String> {
+        std::fs::create_dir_all(dir).map_err(|e| format!("create dir = {}", e))?;
+
+        let queue = std::sync::Arc::new(crossbeam::queue::SegQueue::new());
+        let segment_count = list.len();
+        for (index, ele) in list.iter().enumerate() {
+            // ele.uri
+            // println!("{}", ele.uri);
+            // let v = get_real_url(m3u8, ele.as_str())?;
+            let v = ele;
+            queue.push((v.clone(), format!("{dir}/{}.ts", index)));
+        }
+        let thread_queue = Arc::clone(&queue);
+        // 消费
+        crossbeam::scope(|sc| {
+            for i in 0..self.thread {
+                let s = Arc::clone(&thread_queue);
+                sc.spawn(move |_| {
+                    while let Some(((key, url), file)) = s.pop() {
+                        log::debug!("thread {i} {url}",);
+                        let now = segment_count - s.len();
+                        for i in 0..self.retry {
+                            if let Err(e) = self.download_item(
+                                &key,
+                                url.as_str(),
+                                file.as_str(),
+                                dir,
+                                now,
+                                segment_count,
+                            ) {
+                                log::error!(
+                                "download file fail ={url}, reason =[{e}] after retry {i} count"
+                            );
+                            } else {
+                                // 成功
+                                break;
+                            }
+                        }
+                    }
+                });
+            }
+        })
+        .unwrap();
+
+        // 等待
+        loop {
+            if queue.is_empty() {
+                log::info!("完成");
+                break;
+            }
+        }
+
+        self.concat(
+            list.iter()
+                .enumerate()
+                .map(|(index, _)| format!("{dir}/{index}.ts"))
+                .collect::<Vec<String>>(),
+            out,
+        )
+    }
+
+    fn get_real_url(m3u8: &str, uri: &str) -> Result<String, String> {
+        if uri.starts_with("http") {
+            Ok(uri.to_string())
+        } else {
+            let url = url::Url::parse(m3u8).map_err(|e| e.to_string())?;
+
+            url.join(uri)
+                .map_or_else(|e| Err(e.to_string()), |f| Ok(f.as_str().to_string()))
+        }
+    }
+
+    fn download_inner(&self, url: &str) -> Result<minreq::Response, String> {
+        let mut req = minreq::get(url);
+        if !self.no_proxy {
+            if let Some(proxy) = &self.proxy {
+                req = req.with_proxy(
+                    minreq::Proxy::new(proxy).map_err(|e| format!("proxy not valid {e}"))?,
+                );
+            } else if let Some(proxy) = Self::get_env_proxy(url) {
+                log::info!("use proxy ={proxy}");
+                req = req.with_proxy(
+                    minreq::Proxy::new(proxy).map_err(|e| format!("proxy not valid {e}"))?,
+                );
+            }
+        }
+        req.send().map_err(|e| e.to_string())
+    }
+
+    fn get_env_proxy(url: &str) -> Option<String> {
+        if url.starts_with("https") {
+            std::env::var("HTTPS_PROXY")
+                .or_else(|_| std::env::var("https_proxy"))
+                .or_else(|_| std::env::var("ALL_PROXY"))
+                .or_else(|_| std::env::var("all_proxy"))
+        } else {
+            std::env::var("HTTP_PROXY")
+                .or_else(|_| std::env::var("http_proxy"))
+                .or_else(|_| std::env::var("ALL_PROXY"))
+                .or_else(|_| std::env::var("all_proxy"))
+        }
+        .ok()
+    }
+
+    fn download_item(
+        &self,
+        key: &Option<m3u8_rs::Key>,
+        url: &str,
+        path: &str,
+        dir: &str,
+        now: usize,
+        total: usize,
+    ) -> Result<(), String> {
+        if std::fs::exists(path).unwrap_or(false) {
+            return Ok(());
+        }
+
+        let resp = self.download_inner(url)?;
+        if resp.status_code == 200 {
+            if let Some(len) = resp.headers.get("content-length") {
+                let v = resp.as_bytes();
+                if v.len() == len.parse::<usize>().map_err(|e| e.to_string())? {
+                    log::info!("url = {url} path={path} {now}/{total}");
+                    let v = self.decrypt(key, v, dir)?;
+                    std::fs::write(path, &v[self.skip..]).map_err(|e| e.to_string())?;
+                } else {
+                    return Err("len not eq".to_string());
+                }
+            } else {
+                return Err("no cotent-length".to_string());
+            }
+        } else if resp.status_code == 404 && self.replace_not_found {
+            // 找到最近的下载成功的ts文件，就是上一个
+            for i in (0..now - 1).rev() {
+                let p = Path::system(path).pop().join(format!("{i}.ts").as_str());
+                if std::fs::exists(p.to_string().as_str()).unwrap_or(false)
+                    && std::fs::copy(p.to_string().as_str(), path).is_ok()
+                {
+                    log::info!(
+                        "file {path} not found, use the file [{}] replace it",
+                        p.to_string()
+                    );
+                }
+            }
+        } else {
+            return Err(format!(
+                "down file {url} fail, because the server return {}",
+                resp.status_code
+            ));
+        }
+
+        Ok(())
+    }
+
+    fn decrypt<'a>(
+        &self,
+        key: &Option<m3u8_rs::Key>,
+        value: &[u8],
+        dir: &str,
+    ) -> Result<Vec<u8>, String> {
+        if let Some(key) = key {
+            match &key.method {
+                m3u8_rs::KeyMethod::None => return Ok(value.to_vec()),
+                m3u8_rs::KeyMethod::SampleAES => {
+                    return Err("unsupport decrypt method SampleAES".to_string())
+                }
+                m3u8_rs::KeyMethod::Other(v) => {
+                    return Err(format!("unsupport decrypt method {v}"))
+                }
+                m3u8_rs::KeyMethod::AES128 => {
+                    log::info!("start decrypt");
+                    if let Some(iv) = key
+                        .iv
+                        .as_ref()
+                        .map(|f| f.replace("0x", ""))
+                        .and_then(|f| hex_string_to_bytes(f.as_str()))
+                    {
+                        let v: Option<[u8; 16]> = key
+                            .uri
+                            .as_ref()
+                            .map(|f| {
+                                let mut hash = crypto::md5::Md5::new();
+                                hash.input_str(f.as_str());
+
+                                (format!("{dir}/{}.key", hash.result_str()), f.as_str())
+                            })
+                            .and_then(|(path, uri)| {
+                                log::debug!("read the aes key from file {path}");
+                                std::fs::read(path.as_str())
+                                    .or_else(|_| {
+                                        log::debug!("download the key file from uri = {uri}");
+                                        // 读取uri
+                                        self.download_inner(uri).map(|f| {
+                                            let _ = std::fs::write(path.as_str(), f.as_bytes());
+                                            f.as_bytes().to_vec()
+                                        })
+                                    })
+                                    .ok()
+                            })
+                            .and_then(|f| f.try_into().ok());
+
+                        // 获取key
+                        if let Some(v) = v {
+                            return aes128_cbc_decrypt(
+                                value,
+                                &v,
+                                &iv.try_into().map_err(|f| format!("decrypt e {:?}", f))?,
+                            )
+                            .map_err(|f| format!("decrypt fail {:?}", f));
+                        }
+                        return Err("decrypt fail, reason: get the aes key fail".to_string());
+                    }
+                    return Err("decrypt fail, reason: get the aes iv fail".to_string());
+                }
+            }
+        }
+        Ok(value.to_vec())
+    }
+
+    fn concat(&self, files: Vec<String>, out: &str) -> Result<(), String> {
+        if std::fs::exists(out).unwrap_or(false) {
+            log::warn!("输出文件 {out} 已存在");
+            return Ok(());
+        }
+        let not_download_file = files
+            .iter()
+            .map(|f| f.as_str())
+            .filter(|f| !std::fs::exists(f).unwrap_or(false))
+            .collect::<Vec<&str>>();
+        // 校验所有文件都已下载成功
+        if !not_download_file.is_empty() {
+            log::warn!("文件未下载完成，不合并 [{}]", not_download_file.join(","));
+            return Err("文件未下载完成，不合并".to_string());
+        }
+
+        log::info!("start ffmpeg, the out file = {out}");
+        let c = std::process::Command::new(self.ffmpeg.as_str())
+            .arg("-i")
+            .arg(format!("concat:{}", files.join("|").as_str()).as_str())
+            .arg("-y")
+            .arg("-c")
+            .arg("copy")
+            .arg(out)
+            .stderr(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("exec ffmpeg e ={}", e))?;
+        let mut s = c
+            .wait_with_output()
+            .map_err(|e| format!("ffmpeg exec error = {e}"))?;
+
+        let mut out = Vec::new();
+        out.append(&mut s.stdout);
+        out.append(&mut s.stderr);
+
+        if !s.status.success() {
+            return Err(format!(
+                "ffmpge return e = {}, {}",
+                s.status.code().unwrap_or(-1),
+                String::from_utf8(out).map_err(|e| format!("get out e ={e}"))?
+            ));
+        }
+
+        if self.clear {
+            let dir = Path::system(files[0].as_str()).pop();
+            if let Err(e) = std::fs::remove_dir_all(dir.to_string()) {
+                log::warn!("删除ts文件失败 ={} {e}", dir.to_string());
+            };
+        }
+
+        Ok(())
+    }
 }
-
-fn concat(files: Vec<String>, out: &str, opt: &Opt) -> Result<(), String> {
-    if std::fs::exists(out).unwrap_or(false) {
-        log::warn!("输出文件 {out} 已存在");
-        return Ok(());
-    }
-    let not_download_file = files
-        .iter()
-        .map(|f| f.as_str())
-        .filter(|f| !std::fs::exists(f).unwrap_or(false))
-        .collect::<Vec<&str>>();
-    // 校验所有文件都已下载成功
-    if !not_download_file.is_empty() {
-        log::warn!("文件未下载完成，不合并 [{}]", not_download_file.join(","));
-        return Err("文件未下载完成，不合并".to_string());
-    }
-
-    log::info!("start ffmpeg, the out file = {out}");
-    let c = std::process::Command::new(opt.ffmpeg.as_str())
-        .arg("-i")
-        .arg(format!("concat:{}", files.join("|").as_str()).as_str())
-        .arg("-y")
-        .arg("-c")
-        .arg("copy")
-        .arg(out)
-        .stderr(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("exec ffmpeg e ={}", e))?;
-    let mut s = c
-        .wait_with_output()
-        .map_err(|e| format!("ffmpeg exec error = {e}"))?;
-
-    let mut out = Vec::new();
-    out.append(&mut s.stdout);
-    out.append(&mut s.stderr);
-
-    if !s.status.success() {
-        return Err(format!(
-            "ffmpge return e = {}, {}",
-            s.status.code().unwrap_or(-1),
-            String::from_utf8(out).map_err(|e| format!("get out e ={e}"))?
-        ));
-    }
-
-    if opt.clear {
-        let dir = Path::system(files[0].as_str()).pop();
-        if let Err(e) = std::fs::remove_dir_all(dir.to_string()) {
-            log::warn!("删除ts文件失败 ={} {e}", dir.to_string());
-        };
-    }
-
-    Ok(())
-}
-
 #[derive(Clone)]
 pub(crate) struct Path {
     /// 逐级路径
