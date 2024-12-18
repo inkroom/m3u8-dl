@@ -67,6 +67,22 @@ impl Debug for Opt {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Opt")
             .field("url", &self.url.as_str())
+            .field("dir", &self.dir)
+            .field("name", &self.name)
+            .field("log", &self.log.as_ref().map(|f| f.as_str()).unwrap_or(""))
+            .field("thread", &self.thread)
+            .field("skip", &self.skip)
+            .field("retry", &self.retry)
+            .field("ffmpeg", &self.ffmpeg)
+            .field(
+                "proxy",
+                &self.proxy.as_ref().map(|f| f.as_str()).unwrap_or(""),
+            )
+            .field(
+                "no_proxy",
+                &self.proxy.as_ref().map(|f| f.as_str()).unwrap_or(""),
+            )
+            .field("verbose", &self.verbose)
             .finish()
     }
 }
@@ -115,7 +131,6 @@ mod ureqclient {
                 )
             })?;
             if v.status() == 200 {
-                println!("{:?}", v.headers_names());
                 // let len: usize = match v.header("content-length").and_then(|f| f.parse().ok()) {
                 //     Some(v) => v,
                 //     None => return Err(("request no content-length".to_string(), v.status())),
@@ -172,10 +187,14 @@ mod reqwestclient {
         fn get(&self, url: &str) -> Result<Vec<u8>, (String, u16)> {
             match self.inner.get(url).send().map_err(|e| e.to_string()) {
                 Ok(v) => {
-                    if v.status().is_success() {
-                        v.bytes()
-                            .map(|f| f.to_vec())
-                            .map_err(|f| format!("request {url} fail , reason:{}", f))
+                    let status = v.status();
+                    if status.is_success() {
+                        v.bytes().map(|f| f.to_vec()).map_err(|f| {
+                            (
+                                format!("request {url} fail , reason:{}", f),
+                                status.as_u16(),
+                            )
+                        })
                     } else {
                         Err((
                             format!("request {url} fail, reason: {}", v.status().as_u16()),
@@ -461,7 +480,7 @@ mod custom_log {
         let mut s = env_logger::builder();
         s.default_format()
             .parse_default_env()
-            .format(|buf, record| writeln!(buf, "{}-{:?}: {}", time_format(),record.module_path(), record.args()))
+            .format(|buf, record| writeln!(buf, "{}: {}", time_format(), record.args()))
             .target(env_logger::Target::Pipe(Box::new(Writer::new(opt))));
         if opt.verbose {
             s.filter(Some("rustls"), log::LevelFilter::Off);
