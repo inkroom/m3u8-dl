@@ -81,18 +81,42 @@ jobs:
             merge-multiple: true
             pattern: app-*
             path: app/
-        - name: Release
+        - name: Release Ready
+          id: ready
           env:
             GH_TOKEN: ${{ github.token }}
           run: |
             new_tag=$(date +%Y%m%d)
             now_tag=$(curl -sSf https://api.github.com/repos/inkroom/m3u8-dl/releases/latest | jq --raw-output '.tag_name')
-            if [[ "$new_tag" = "$now_tag" ]]
-            then
+            if [[ "$new_tag" = "$now_tag" ]]; then
+              echo "delete $now_tag"
               gh release delete $now_tag
               now_tag=$(curl -sSf https://api.github.com/repos/inkroom/m3u8-dl/releases | jq --raw-output '.[0].tag_name')
             fi
             commit=$(git rev-list -n 1 $now_tag)
-            msg=$(git --no-pager log --pretty=format:"%s" $commit..HEAD | awk '{print "- " $0}')
             echo "$commit"
-            gh release create -n "$msg" --target master $(date +%Y%m%d) ./app/*
+
+            temp=$(git --no-pager tag | grep $new_tag || echo "")
+            if [[ "$temp" = "$new_tag" ]]; then
+                echo "delete remote tag $new_tag"
+                git push origin --delete $new_tag
+                git tag -d $new_tag
+            fi
+            git tag $new_tag
+            echo "create tag $new_tag"
+            git push origin $new_tag
+            # commit=$(git --no-pager log --pretty=format:"%H" | grep -B 1 $commit | head -n 1)
+            echo "after-$commit"
+            msg=$(git --no-pager log --pretty=format:"- [%s](https://github.com/${{ github.repository}}/commit/%H)" $commit..HEAD)
+            echo "$msg" > body.md
+            echo "tag=$new_tag" >> $GITHUB_OUTPUT
+            # 如果直接指向master，release会落后一个commit
+            # gh release create -n "$msg" --target $new_tag $(date +%Y%m%d) ./app/*
+        - name: Create Release
+          uses: ncipollo/release-action@v1
+          env:
+            GH_TOKEN: ${{ github.token }}
+          with:
+            artifacts: "app/*"
+            bodyFile: "body.md"
+            tag: ${{ steps.ready.outputs.tag }}
