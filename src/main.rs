@@ -1,10 +1,10 @@
 use std::fmt::Debug;
+use std::sync::atomic::AtomicU32;
 use std::time::SystemTime;
 use std::{ffi::CString, sync::Arc};
 
 use clap::Parser;
 use crypto::digest::Digest;
-use log::LevelFilter;
 
 use m3u8_rs::Playlist;
 
@@ -56,7 +56,15 @@ pub struct Opt {
     replace_not_found: bool,
     #[arg(short, long, default_value = "false", help = "输出更多日志")]
     verbose: bool,
-
+    #[arg(long, help = "从文件读取json格式")]
+    json_file: Option<String>,
+    #[arg(
+        short,
+        long,
+        help = "读取json格式",
+        long_help = "读取json格式，例如[{\"n\":\"1.mp4\",\"u\":\"http://demo.com/1.m3u8\",\"d\":\"/root\"}]"
+    )]
+    json: Option<String>,
     #[arg(skip)]
     client: Option<Box<dyn HttpClient + Send + Sync>>,
     #[arg(skip)]
@@ -69,19 +77,13 @@ impl Debug for Opt {
             .field("url", &self.url.as_str())
             .field("dir", &self.dir)
             .field("name", &self.name)
-            .field("log", &self.log.as_ref().map(|f| f.as_str()).unwrap_or(""))
+            .field("log", &self.log.as_deref().unwrap_or(""))
             .field("thread", &self.thread)
             .field("skip", &self.skip)
             .field("retry", &self.retry)
             .field("ffmpeg", &self.ffmpeg)
-            .field(
-                "proxy",
-                &self.proxy.as_ref().map(|f| f.as_str()).unwrap_or(""),
-            )
-            .field(
-                "no_proxy",
-                &self.proxy.as_ref().map(|f| f.as_str()).unwrap_or(""),
-            )
+            .field("proxy", &self.proxy.as_deref().unwrap_or(""))
+            .field("no_proxy", &self.proxy.as_deref().unwrap_or(""))
             .field("verbose", &self.verbose)
             .finish()
     }
@@ -168,7 +170,7 @@ mod reqwestclient {
                     log::debug!("use proxy = {}", proxy);
                     c = c.no_proxy().proxy(
                         reqwest::Proxy::all(proxy)
-                            .expect(format!("unvalid proxy = {}", proxy).as_str()),
+                            .unwrap_or_else(|_| panic!("unvalid proxy = {}", proxy)),
                     );
                 } else {
                     log::debug!("will use the env proxy config");
@@ -206,6 +208,23 @@ mod reqwestclient {
             }
         }
     }
+}
+
+enum Task {
+    M3u8 {
+        name: String,
+        url: String,
+        dir: String,
+    },
+    Ts {
+        key: Option<m3u8_rs::Key>,
+        url: String,
+        path: String,
+        dir: String,
+        files: Vec<String>,
+        out: String,
+        count: Arc<AtomicU32>,
+    },
 }
 
 fn main() {
@@ -335,7 +354,7 @@ impl std::io::Write for Opt {
 }
 mod custom_log {
     use crate::Opt;
-    use env_logger::fmt::Formatter;
+
     use std::io::Write;
     /// 时间戳转换，从1970年开始
     pub(crate) fn time_display(value: u64) -> String {
@@ -398,7 +417,7 @@ mod custom_log {
             time -= ele;
         }
 
-        return format!(
+        format!(
             "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
             year,
             month,
@@ -406,13 +425,13 @@ mod custom_log {
             hour + 8,
             min,
             sec
-        );
+        )
     }
     //
     // 判断是否是闰年
     //
     fn is_leap(year: u64) -> bool {
-        return year % 4 == 0 && ((year % 100) != 0 || year % 400 == 0);
+        year % 4 == 0 && ((year % 100) != 0 || year % 400 == 0)
     }
     ///
     /// 输出当前时间格式化
@@ -437,17 +456,13 @@ mod custom_log {
         pub fn new(opt: &Opt) -> Self {
             Writer {
                 console: std::io::stdout(),
-                fs: if let Some(f) = &opt.log {
-                    Some(
-                        std::fs::OpenOptions::new()
-                            .create(true)
-                            .append(true)
-                            .open(f.as_str())
-                            .unwrap(),
-                    )
-                } else {
-                    None
-                },
+                fs: opt.log.as_ref().map(|f| {
+                    std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(f.as_str())
+                        .unwrap()
+                }),
             }
         }
     }
@@ -550,7 +565,7 @@ impl Opt {
         }
         #[cfg(feature = "west")]
         {
-            self.client = Some(Box::new(reqwestclient::ReqWestClient::init(&self)?));
+            self.client = Some(Box::new(reqwestclient::ReqWestClient::init(self)?));
         }
 
         self.begin = Some(SystemTime::now());
@@ -574,25 +589,13 @@ impl Opt {
             log::info!("the out file exists = [{out}] ");
             return Ok(());
         }
-
-        let ts = self.get_m3u8_ts_url(self.url.as_str(), "")?;
-
-        self.download(
-            ts,
-            format!(
-                "{}/{}",
-                self.dir,
-                self.name.replace(".mp4", "").replace(".mkv", "")
-            )
-            .as_str(),
-            out.as_str(),
-        )?;
+        self.create_queue()?;
 
         log::info!(
             "下载完成 {} 耗时 ={}秒",
             self.url,
             SystemTime::now()
-                .duration_since(self.begin.clone().unwrap())
+                .duration_since(self.begin.unwrap())
                 .unwrap()
                 .as_secs()
         );
@@ -619,14 +622,14 @@ impl Opt {
                                 &mut self.get_m3u8_ts_url(m3u8_url.as_str(), ele.uri.as_str())?,
                             );
                         }
-                        return Ok(v);
+                        Ok(v)
                     }
                     Ok(Playlist::MediaPlaylist(me)) => {
                         // 如果有需要解密的key，这个key只会出现在第0个ts上，但是每个ts都需要用
 
                         let key = me.segments[0].key.clone();
 
-                        return Ok(me
+                        Ok(me
                             .segments
                             .iter()
                             .map(|f| {
@@ -637,79 +640,141 @@ impl Opt {
                             })
                             .filter(|f| f.1.is_ok())
                             .map(|f| (f.0, f.1.unwrap().to_string()))
-                            .collect::<Vec<(Option<m3u8_rs::Key>, String)>>());
+                            .collect::<Vec<(Option<m3u8_rs::Key>, String)>>())
                     }
-                    Err(e) => return Err(e.to_string()),
+                    Err(e) => Err(e.to_string()),
                 }
             }
             Err((e, status)) => Err(format!("resp error {} {} {e}", status, m3u8_url)),
         }
     }
 
-    fn download(
-        &self,
-        list: Vec<(Option<m3u8_rs::Key>, String)>,
-        dir: &str,
-        out: &str,
-    ) -> Result<(), String> {
-        std::fs::create_dir_all(dir).map_err(|e| format!("create dir = {}", e))?;
-
+    fn create_queue(&self) -> Result<(), String> {
         let queue = std::sync::Arc::new(crossbeam::queue::SegQueue::new());
-        let segment_count = list.len();
-        for (index, ele) in list.iter().enumerate() {
-            // ele.uri
-            // println!("{}", ele.uri);
-            // let v = get_real_url(m3u8, ele.as_str())?;
-            let v = ele;
-            queue.push((v.clone(), format!("{dir}/{}.ts", index)));
-        }
+
+        // let client: Arc<Box<dyn HttpClient>> =
+        //     Arc::new(Box::new(reqwestclient::ReqWestClient::init(&self).unwrap()));
+
+        queue.push(Task::M3u8 {
+            name: self.name.clone(),
+            url: self.url.clone(),
+            dir: self.dir.clone(),
+            // client: Arc::clone(&client),
+        });
+
+        let m3u8_count: Arc<AtomicU32> = Arc::new(AtomicU32::new(queue.len() as u32));
+        let m3u8_fail_count: Arc<AtomicU32> = Arc::new(AtomicU32::new(0));
+
         let thread_queue = Arc::clone(&queue);
         // 消费
-        crossbeam::scope(|sc| {
+        crossbeam::thread::scope(|sc| {
             for i in 0..self.thread {
                 let s = Arc::clone(&thread_queue);
+                let m3u8_count: Arc<AtomicU32> = Arc::clone(&m3u8_count);
+                let m3u8_fail_count: Arc<AtomicU32> = Arc::clone(&m3u8_fail_count);
                 sc.spawn(move |_| {
-                    while let Some(((key, url), file)) = s.pop() {
-                        log::debug!("thread {i} {url}",);
-                        let now = segment_count - s.len();
-                        for i in 0..self.retry {
-                            if let Err(e) = self.download_item(
-                                &key,
-                                url.as_str(),
-                                file.as_str(),
-                                dir,
-                                now,
-                                segment_count,
-                            ) {
-                                log::error!(
-                                "download file fail ={url}, reason =[{e}] after retry {i} count"
-                            );
-                            } else {
-                                // 成功
-                                break;
-                            }
+                    loop{
+                        if m3u8_count.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                            break;
                         }
-                    }
+                    
+                    if let Some(task) = s.pop() {
+                        match task {
+                            Task::M3u8 {
+                                name,
+                                url,
+                                dir,
+                            } => {
+                                log::debug!("thread {i} {url}",);
+                                let mut c = 0;
+
+                                loop {
+                                    c += 1;
+                                    match self.get_m3u8_ts_url(url.as_str(), "") {
+                                        Ok(ts) => {
+
+                                            let dir = format!(
+                                                "{}/{}",
+                                                dir,
+                                                self.name.replace(".mp4", "").replace(".mkv", "")
+                                            );
+                                            if let Err(e) = std::fs::create_dir_all(dir.as_str()) {
+                                                log::error!("create dir fail {e}");
+                                                return;
+                                            };
+
+                                            let out = format!("{}/{}", dir, name);
+                                            let files:Vec<String> = ts.iter().enumerate().map(|(index,_)|format!("{dir}/{}.ts",index+1)).collect();
+                                            let mut index = 0;
+                                            let count = std::sync::Arc::new(AtomicU32::new(files.len() as u32));
+                                            for (key, url) in ts {
+
+                                                index += 1;
+                                                let file = format!("{dir}/{}.ts", index);
+                                                s.push(Task::Ts {
+                                                    key,
+                                                    url,
+                                                    path: file,
+                                                    dir: dir.clone(),
+                                                    files: files.clone(),
+                                                    out: out.clone(),
+                                                    count: std::sync::Arc::clone(&count),
+                                                    // client: (),
+                                                });
+                                            }
+
+                                            break;
+                                        }
+                                        Err(e) => {
+                                            log::error!(
+                                                "get m3u8 file fail after retry {c}, reason: [{e}]"
+                                            );
+                                        }
+                                    }
+                                }
+                            },
+                            Task::Ts {
+                                key,
+                                url,
+                                path,
+                                dir,
+                                files,
+                                out,
+                                count,
+                            } => {
+                                log::debug!("thread {i} {url}",);
+                                for i in 0..self.retry {
+                                    if let Err(e) = self.download_item(&key, url.as_str(), path.as_str(), dir.as_str(), files.len() - count.load(std::sync::atomic::Ordering::SeqCst) as usize, files.len()) {
+                                        log::error!(
+                                        "download file fail ={url}, reason =[{e}] after retry {i} count"
+                                    );
+                                    } else {
+                                        // 成功
+                                        break;
+                                    }
+                                }
+                                 let v = count.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                                if v == 1 {
+                                    log::info!("ts file download complete");
+                                    if let Err(e) = self.concat(files, out.as_str()) {
+                                        log::error!("concat video fail, reason: {e}");
+                                        m3u8_fail_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                    }
+                                    m3u8_count.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                                }
+                            },
+                        }
+                    }}
                 });
             }
-        })
-        .unwrap();
+        }).map_err(|e|format!("thread fail {:?}",e))?;
 
-        // 等待
-        loop {
-            if queue.is_empty() {
-                log::info!("完成");
-                break;
-            }
+        let s = m3u8_fail_count.load(std::sync::atomic::Ordering::SeqCst);
+        if s != 0 {
+            // 有m3u8下载失败
+            return Err("download complete, some video fail".to_string());
         }
-
-        self.concat(
-            list.iter()
-                .enumerate()
-                .map(|(index, _)| format!("{dir}/{index}.ts"))
-                .collect::<Vec<String>>(),
-            out,
-        )
+        Ok(())
     }
 
     fn get_real_url(m3u8: &str, uri: &str) -> Result<String, String> {
@@ -739,12 +804,12 @@ impl Opt {
         now: usize,
         total: usize,
     ) -> Result<(), String> {
+        log::info!("url = {url} path={path} {now}/{total}");
         if std::fs::exists(path).unwrap_or(false) {
             return Ok(());
         }
         match self.download_inner(url) {
             Ok(v) => {
-                log::info!("url = {url} path={path} {now}/{total}");
                 let v = self.decrypt(key, &v, dir)?;
                 std::fs::write(path, &v[self.skip..]).map_err(|e| e.to_string())?;
             }
@@ -955,6 +1020,8 @@ impl Path {
 }
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicU32;
+
     use crate::Path;
 
     #[test]
@@ -972,60 +1039,21 @@ mod tests {
 
     #[test]
     fn log() {
-        let pattern = "{d(%Y-%m-%d %H:%M:%S)} : {m}{n}";
-        let mut s = log4rs::Config::builder()
-            .appender(
-                log4rs::config::Appender::builder().build(
-                    "stdout",
-                    Box::new(
-                        log4rs::append::console::ConsoleAppender::builder()
-                            .encoder(Box::new(log4rs::encode::pattern::PatternEncoder::new(
-                                pattern,
-                            )))
-                            .build(),
-                    ),
-                ),
-            )
-            .logger(log4rs::config::Logger::builder().build("rustls", log::LevelFilter::Off));
+        // 消费
 
-        // // println!("{:?}", opt);
-        // let s = simple_log::LogConfigBuilder::builder()
-        //     .level(if opt.verbose {
-        //         "debug,rustls=info"
-        //     } else {
-        //         "info"
-        //     })
-        //     .unwrap()
-        //     .time_format("%Y-%m-%d %H:%M:%S")
-        //     .output_console();
+        let se = AtomicU32::new(3);
+        println!("{}", se.fetch_sub(1, std::sync::atomic::Ordering::SeqCst));
+        println!("{}", se.fetch_sub(1, std::sync::atomic::Ordering::SeqCst));
 
-        // if let Some(log) = &opt.log {
-        s = s.appender(
-            log4rs::config::Appender::builder().build(
-                "file",
-                Box::new(
-                    log4rs::append::file::FileAppender::builder()
-                        .encoder(Box::new(log4rs::encode::pattern::PatternEncoder::new(
-                            pattern,
-                        )))
-                        .build("55.log")
-                        .unwrap(),
-                ),
-            ),
-        );
-        // }
+        // crossbeam::scope(|sc| {
+        //     sc.spawn(|_| {
+        //         println!("spawn1");
+        //         std::thread::sleep(Duration::from_secs(20));
+        //         println!("spawn2");
+        //     });
+        // })
+        // .unwrap();
 
-        log4rs::init_config(
-            s.build(
-                log4rs::config::Root::builder()
-                    .appender("stdout")
-                    .appender("file")
-                    .build(log::LevelFilter::Debug),
-            )
-            .unwrap(),
-        )
-        .unwrap();
-
-        log::info!("参数=");
+        // println!("scope over")
     }
 }
