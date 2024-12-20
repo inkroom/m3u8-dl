@@ -420,6 +420,137 @@ mod json {
     }
 }
 
+mod threadpool {
+    use std::{
+        sync::{mpsc::channel, Arc, Mutex},
+        thread,
+        thread::JoinHandle,
+    };
+
+    // 包装匿名函数类型
+    // type Workfn<T> = Fn(Box<T>, &Arc<Sender<T>>) -> () + Send + Sync;
+    // 区分工作和停机消息
+    enum Msg<T> {
+        Work(Box<T>),
+        Down,
+    }
+    // 使用Msg命名空间
+    use Msg::*;
+
+    pub struct Sender<T> {
+        inner: std::sync::mpsc::Sender<Msg<T>>,
+        count: usize,
+    }
+
+    impl<T> Sender<T> {
+        pub fn send(&self, value: T) {
+            self.inner.send(Work(Box::new(value))).unwrap();
+        }
+
+        pub fn shutdown(&self) {
+            self.inner.send(Down).unwrap();
+        }
+
+        pub fn shutdown_all(&self) {
+            for _ in 0..self.count {
+                self.inner.send(Down).unwrap();
+            }
+        }
+    }
+
+    // 主构造函数Concurrent
+    pub struct Concur<T> {
+        count: usize,                         // 线程数量
+        sender: Arc<Sender<T>>,               // 异步发送器
+        threads: Option<Vec<JoinHandle<()>>>, // 带有 原子指针 异步接收器 的线程 列表
+    }
+
+    impl<T: Send + Sync + 'static> Concur<T> {
+        // 初始化函数
+        pub fn new<F>(count: usize, fun: F) -> Self
+        where
+            F: Fn(Box<T>, &Arc<Sender<T>>),
+            F: Sync,
+            F: Send + 'static,
+        {
+            let mut threads = Vec::with_capacity(count);
+            let (sender, receiver) = channel();
+            let sender = Arc::new(Sender {
+                inner: sender,
+                count,
+            });
+            let receiver = Arc::new(Mutex::new(receiver));
+            let arc_fn = Arc::new(fun);
+            for i in 0..count {
+                let p_rec = Arc::clone(&receiver);
+                let arc_fn = Arc::clone(&arc_fn);
+                let sender = Arc::clone(&sender);
+
+                threads.push(thread::spawn(move || loop {
+                    let f: Msg<T> = p_rec.lock().unwrap().recv().unwrap();
+                    match f {
+                        Work(v) => {
+                            log::debug!("thread {i} start work");
+                            arc_fn(v, &sender);
+                        }
+                        Down => {
+                            break;
+                        }
+                    };
+                }));
+            }
+            Concur {
+                count,
+                sender,
+                threads: Some(threads),
+            }
+        }
+
+        pub fn push(&self, f: T) {
+            self.sender.send(f);
+        }
+
+        pub fn wait(&mut self) {
+            for thread in self.threads.take().unwrap() {
+                thread.join().unwrap();
+            }
+        }
+    }
+
+    impl<T> Drop for Concur<T> {
+        fn drop(&mut self) {
+            // 发送停机消息
+            for i in 0..self.count {
+                if let Some(t) = self.threads.as_ref() {
+                    if !t[i].is_finished() {
+                        self.sender.shutdown();
+                    }
+                }
+            }
+            if self.threads.is_some() {
+                // 等待所有线程运行完毕
+                for thread in self.threads.take().unwrap() {
+                    thread.join().unwrap();
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::Concur;
+
+        #[test]
+        fn test() {
+            let v: Concur<usize> = Concur::new(2, |v, se| {
+                println!("value = {}", v);
+            });
+            for i in 39..542 {
+                v.push(i);
+            }
+        }
+    }
+}
 pub trait HttpClient: Send {
     fn init(opt: &Cli) -> Result<Self, String>
     where
@@ -853,7 +984,7 @@ impl Opt {
         })
     }
 
-    fn run(&mut self) -> Result<(), String> {
+    fn run(self) -> Result<(), String> {
         #[cfg(any(target_os = "macos", target_os = "linux"))]
         if let Some(uid) = self.uid {
             unsafe {
@@ -861,12 +992,13 @@ impl Opt {
                 let _ = libc::setgid(uid);
             }
         }
+        let b = self.begin.unwrap();
         self.create_queue()?;
 
         log::info!(
             "下载完成 耗时 ={}秒",
             SystemTime::now()
-                .duration_since(self.begin.unwrap())
+                .duration_since(b)
                 .unwrap()
                 .as_secs()
         );
@@ -919,14 +1051,140 @@ impl Opt {
         }
     }
 
-    fn create_queue(&self) -> Result<(), String> {
-        let queue = std::sync::Arc::new(crossbeam::queue::SegQueue::new());
+    fn start_m3u8(
+        se2: &Arc<Opt>,
+        sender: &Arc<threadpool::Sender<Task>>,
+        name: String,
+        url: String,
+        dir: String,
+    ) -> Result<bool, String> {
+        // log::debug!("thread {i} {url}",);
+        let dir = format!("{}/{}", dir, name.replace(".mp4", "").replace(".mkv", ""));
+        let out = format!("{}/{}", dir, name);
 
-        // let client: Arc<Box<dyn HttpClient>> =
-        //     Arc::new(Box::new(reqwestclient::ReqWestClient::init(&self).unwrap()));
+        if std::fs::exists(out.as_str()).unwrap_or(false) {
+            log::info!("the video file exists = [{out}] ");
+            return Ok(false);
+        }
 
-        for ele in &self.m3u8 {
-            queue.push(Task::M3u8 {
+        for c in 0..se2.thread {
+            match se2.get_m3u8_ts_url(url.as_str(), "") {
+                Ok(ts) => {
+                    if let Err(e) = std::fs::create_dir_all(dir.as_str()) {
+                        log::error!("create dir fail {e}");
+                        return Err("fail".to_string());
+                    };
+
+                    let files: Vec<String> = ts
+                        .iter()
+                        .enumerate()
+                        .map(|(index, _)| format!("{dir}/{}.ts", index + 1))
+                        .collect();
+                    let mut index = 0;
+                    let count = std::sync::Arc::new(AtomicU32::new(files.len() as u32));
+                    for (key, url) in ts {
+                        index += 1;
+                        let file = format!("{dir}/{}.ts", index);
+                        sender.send(Task::Ts {
+                            key,
+                            url,
+                            path: file,
+                            dir: dir.clone(),
+                            files: files.clone(),
+                            out: out.clone(),
+                            count: std::sync::Arc::clone(&count),
+                        });
+                    }
+                    return Ok(true);
+                }
+                Err(e) => {
+                    log::error!("get m3u8 file fail after retry {c}, reason: [{e}]");
+                    if c == se2.thread - 1 {
+                        return Err("fail".to_string());
+                    }
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    fn create_queue(self) -> Result<(), String> {
+        let m3u8_count: Arc<AtomicU32> = Arc::new(AtomicU32::new((&self.m3u8).len() as u32));
+        let m3u8_fail_count: Arc<AtomicU32> = Arc::new(AtomicU32::new(0));
+        let m3u8_fail_count2: Arc<AtomicU32> = Arc::clone(&m3u8_fail_count);
+
+        let se = Arc::new(self);
+        let se2 = Arc::clone(&se);
+        let mut pool: threadpool::Concur<Task> =
+            threadpool::Concur::new(se.thread as usize, move |task, sender| {
+                #[inline]
+                fn finish_m3u8(
+                    m3u8_count: &Arc<AtomicU32>,
+                    sender: &Arc<threadpool::Sender<Task>>,
+                ) {
+                    let v = m3u8_count.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                    // 退出线程
+                    if v == 1 {
+                        // 最后一个任务，直接退出所有线程
+                        sender.shutdown_all();
+                    }
+                }
+
+                match *task {
+                    Task::M3u8 { name, url, dir } => {
+                        match Self::start_m3u8(&se2, sender, name, url, dir) {
+                            Ok(started) => {
+                                if !started {
+                                    finish_m3u8(&m3u8_count, sender);
+                                }
+                            }
+                            Err(_) => {
+                                finish_m3u8(&m3u8_count, sender);
+                            }
+                        }
+                    }
+                    Task::Ts {
+                        key,
+                        url,
+                        path,
+                        dir,
+                        files,
+                        out,
+                        count,
+                    } => {
+                        for i in 0..se2.retry {
+                            if let Err(e) = se2.download_item(
+                                &key,
+                                url.as_str(),
+                                path.as_str(),
+                                dir.as_str(),
+                                files.len()
+                                    - count.load(std::sync::atomic::Ordering::SeqCst) as usize,
+                                files.len(),
+                            ) {
+                                log::error!(
+                            "download file fail ={url}, reason =[{e}] after retry {i} count"
+                        );
+                            } else {
+                                // 成功
+                                break;
+                            }
+                        }
+                        // 最后一个ts文件
+                        let v = count.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                        if v == 1 {
+                            log::info!("ts file download complete");
+                            if let Err(e) = se2.concat(files, out.as_str()) {
+                                log::error!("concat video fail, reason: {e}");
+                                m3u8_fail_count2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            }
+                            finish_m3u8(&m3u8_count, sender);
+                        }
+                    }
+                }
+            });
+        for ele in &se.m3u8 {
+            pool.push(Task::M3u8 {
                 name: ele.name.clone(),
                 url: ele.url.clone(),
                 dir: ele.dir.clone(),
@@ -934,117 +1192,8 @@ impl Opt {
             });
         }
 
-        let m3u8_count: Arc<AtomicU32> = Arc::new(AtomicU32::new(queue.len() as u32));
-        let m3u8_fail_count: Arc<AtomicU32> = Arc::new(AtomicU32::new(0));
-
-        let thread_queue = Arc::clone(&queue);
-        // 消费
-        crossbeam::thread::scope(|sc| {
-            for i in 0..self.thread {
-                let s = Arc::clone(&thread_queue);
-                let m3u8_count: Arc<AtomicU32> = Arc::clone(&m3u8_count);
-                let m3u8_fail_count: Arc<AtomicU32> = Arc::clone(&m3u8_fail_count);
-                sc.spawn(move |_| {
-                    loop{
-                        if m3u8_count.load(std::sync::atomic::Ordering::SeqCst) == 0 {
-                            break;
-                        }
-                        if let Some(task) = s.pop() {
-                            match task {
-                                Task::M3u8 {
-                                    name,
-                                    url,
-                                    dir,
-                                } => {
-                                    log::debug!("thread {i} {url}",);
-                                    let dir = format!(
-                                        "{}/{}",
-                                        dir,
-                                        name.replace(".mp4", "").replace(".mkv", "")
-                                    );
-                                    let out = format!("{}/{}", dir, name);
-
-                                    if std::fs::exists(out.as_str()).unwrap_or(false) {
-                                        log::info!("the out file exists = [{out}] ");
-                                        return;
-                                    }
-                                    let mut c = 0;
-
-                                    loop {
-                                        c += 1;
-                                        match self.get_m3u8_ts_url(url.as_str(), "") {
-                                            Ok(ts) => {
-                                                if let Err(e) = std::fs::create_dir_all(dir.as_str()) {
-                                                    log::error!("create dir fail {e}");
-                                                    return;
-                                                };
-
-                                                let files:Vec<String> = ts.iter().enumerate().map(|(index,_)|format!("{dir}/{}.ts",index+1)).collect();
-                                                let mut index = 0;
-                                                let count = std::sync::Arc::new(AtomicU32::new(files.len() as u32));
-                                                for (key, url) in ts {
-
-                                                    index += 1;
-                                                    let file = format!("{dir}/{}.ts", index);
-                                                    s.push(Task::Ts {
-                                                        key,
-                                                        url,
-                                                        path: file,
-                                                        dir: dir.clone(),
-                                                        files: files.clone(),
-                                                        out: out.clone(),
-                                                        count: std::sync::Arc::clone(&count),
-                                                    });
-                                                }
-
-                                                break;
-                                            }
-                                            Err(e) => {
-                                                log::error!(
-                                                    "get m3u8 file fail after retry {c}, reason: [{e}]"
-                                                );
-                                            }
-                                        }
-                                    }
-                                },
-                                Task::Ts {
-                                    key,
-                                    url,
-                                    path,
-                                    dir,
-                                    files,
-                                    out,
-                                    count,
-                                } => {
-                                    log::debug!("thread {i} {url}",);
-                                    for i in 0..self.retry {
-                                        if let Err(e) = self.download_item(&key, url.as_str(), path.as_str(), dir.as_str(), files.len() - count.load(std::sync::atomic::Ordering::SeqCst) as usize, files.len()) {
-                                            log::error!(
-                                            "download file fail ={url}, reason =[{e}] after retry {i} count"
-                                        );
-                                        } else {
-                                            // 成功
-                                            break;
-                                        }
-                                    }
-                                    let v = count.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-                                    if v == 1 {
-                                        log::info!("ts file download complete");
-                                        if let Err(e) = self.concat(files, out.as_str()) {
-                                            log::error!("concat video fail, reason: {e}");
-                                            m3u8_fail_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                                        }
-                                        m3u8_count.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-                                    }
-                                },
-                            }
-                        }
-                    }
-                });
-            }
-        }).map_err(|e|format!("thread fail {:?}",e))?;
-
-        let s = m3u8_fail_count.load(std::sync::atomic::Ordering::SeqCst);
+        pool.wait();
+        let s = m3u8_fail_count.load(std::sync::atomic::Ordering::Acquire);
         if s != 0 {
             // 有m3u8下载失败
             return Err("download complete, some video fail".to_string());
