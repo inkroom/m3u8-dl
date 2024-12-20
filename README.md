@@ -6,7 +6,7 @@
 ## usage
 
 ```
-Usage: m3u8-dl [OPTIONS] --url <URL> --dir <DIR> --name <NAME>
+Usage: m3u8-dl [OPTIONS]
 
 Options:
   -u, --url <URL>
@@ -17,6 +17,12 @@ Options:
 
   -n, --name <NAME>
           输出文件名，必须以mp4或者mkv结尾
+
+  -j, --json <JSON>
+          读取json格式，例如[{"n":"1.mp4","u":"http://demo.com/1.m3u8","d":"/root"}]
+
+      --json-file <JSON_FILE>
+          从文件读取json格式
 
       --uid <UID>
           使用指定uid运行程序(unavailable for window)
@@ -57,7 +63,7 @@ Options:
           [default: ffmpeg]
 
       --replace-not-found
-          当ts返回404时，使用最近的已下载的ts替换
+          当ts返回404时，使用最近的已下载的ts替换；如果启用多线程可能会导致替换失败或者源文件过于靠前
 
   -v, --verbose
           输出更多日志
@@ -65,6 +71,15 @@ Options:
   -h, --help
           Print help (see a summary with '-h')
 ```
+
+一共三种使用方式，如果只需要下载单个视频，使用`-u`、`-d`、`-n`
+
+如果下载大量视频，使用 json格式，样例如下
+```json
+[{"n":"1.mp4","u":"http://demo.com/1.m3u8","d":"/root"}]
+```
+
+通过`--json`直接传入json字符串，或者使用`--json-file`指定json文件位置，在unix上也可使用管道传递，例如`cat 1.json | m3u8-dl`
 
 ## 构建
 
