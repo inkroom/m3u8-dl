@@ -266,10 +266,19 @@ mod json {
                             } else if let Some(t) = &key {
                                 // value
                                 if t == "n" {
+                                    if item.name.is_some() {
+                                        return Err(format!("Duplicate object key [{}]", t));
+                                    }
                                     item.name = Some(temp);
                                 } else if t == "d" {
+                                    if item.dir.is_some() {
+                                        return Err(format!("Duplicate object key [{}]", t));
+                                    }
                                     item.dir = Some(temp);
                                 } else if t == "u" {
+                                    if item.url.is_some() {
+                                        return Err(format!("Duplicate object key [{}]", t));
+                                    }
                                     item.url = Some(temp);
                                 } else {
                                     return Err(format!("unsupport key: {t}"));
@@ -408,7 +417,7 @@ mod json {
         }
 
         #[test]
-        fn t() {
+        fn mul() {
             let v =
                 r#"[{"n" : "name.mp4", "u":"url","d":"d"},{"n" : "name.mp4", "u":"url","d":"d"}]"#;
             let s = read_json(v).unwrap();
@@ -417,9 +426,20 @@ mod json {
             assert_eq!("d", s[0].dir);
             assert_eq!("url", s[0].url);
         }
+
+        #[test]
+        #[should_panic]
+        fn duplicate() {
+            let v =
+                r#"[{"n" : "name.mp4", "u":"url","d":"d"},{"n" : "name.mp4", "u":"url","u":"d"}]"#;
+            let s = read_json(v).unwrap();
+            assert_eq!(2, s.len());
+            assert_eq!("name.mp4", s[0].name);
+            assert_eq!("d", s[0].dir);
+            assert_eq!("url", s[0].url);
+        }
     }
 }
-
 mod threadpool {
     use std::{
         sync::{mpsc::channel, Arc, Mutex},
@@ -997,10 +1017,7 @@ impl Opt {
 
         log::info!(
             "下载完成 耗时 ={}秒",
-            SystemTime::now()
-                .duration_since(b)
-                .unwrap()
-                .as_secs()
+            SystemTime::now().duration_since(b).unwrap().as_secs()
         );
         Ok(())
     }
