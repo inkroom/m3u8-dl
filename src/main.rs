@@ -1076,8 +1076,8 @@ impl Opt {
         dir: String,
     ) -> Result<bool, String> {
         // log::debug!("thread {i} {url}",);
-        let dir = format!("{}/{}", dir, name.replace(".mp4", "").replace(".mkv", ""));
         let out = format!("{}/{}", dir, name);
+        let dir = format!("{}/{}", dir, name.replace(".mp4", "").replace(".mkv", ""));
 
         if std::fs::exists(out.as_str()).unwrap_or(false) {
             log::info!("the video file exists = [{out}] ");
@@ -1190,7 +1190,7 @@ impl Opt {
                         // 最后一个ts文件
                         let v = count.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                         if v == 1 {
-                            log::info!("ts file download complete");
+                            log::info!("ts file download complete, ready for concat to {out}");
                             if let Err(e) = se2.concat(files, out.as_str()) {
                                 log::error!("concat video fail, reason: {e}");
                                 m3u8_fail_count2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
