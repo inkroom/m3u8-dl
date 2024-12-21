@@ -698,7 +698,7 @@ enum Task {
         url: String,
         path: String,
         dir: String,
-        files: Vec<String>,
+        files: Arc<Vec<String>>,
         out: String,
         count: Arc<AtomicU32>,
     },
@@ -1111,11 +1111,12 @@ impl Opt {
                         return Err("fail".to_string());
                     };
 
-                    let files: Vec<String> = ts
-                        .iter()
-                        .enumerate()
-                        .map(|(index, _)| format!("{dir}/{}.ts", index + 1))
-                        .collect();
+                    let files: Arc<Vec<String>> = Arc::new(
+                        ts.iter()
+                            .enumerate()
+                            .map(|(index, _)| format!("{dir}/{}.ts", index + 1))
+                            .collect(),
+                    );
                     let mut index = 0;
                     let count = std::sync::Arc::new(AtomicU32::new(files.len() as u32));
                     for (key, url) in ts {
@@ -1126,7 +1127,7 @@ impl Opt {
                             url,
                             path: file,
                             dir: dir.clone(),
-                            files: files.clone(),
+                            files: Arc::clone(&files),
                             out: out.clone(),
                             count: std::sync::Arc::clone(&count),
                         });
@@ -1364,7 +1365,7 @@ impl Opt {
         Ok(value.to_vec())
     }
 
-    fn concat(&self, files: Vec<String>, out: &str) -> Result<(), String> {
+    fn concat(&self, files: Arc<Vec<String>>, out: &str) -> Result<(), String> {
         if std::fs::exists(out).unwrap_or(false) {
             log::warn!("输出文件 {out} 已存在");
             return Ok(());
