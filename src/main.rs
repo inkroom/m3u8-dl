@@ -26,7 +26,7 @@ pub struct Cli {
     #[arg(long, help = "从文件读取json格式")]
     json_file: Option<String>,
     #[cfg(any(target_os = "macos", target_os = "linux"))]
-    #[arg(long, help = "使用指定uid运行程序(unavailable on window)")]
+    #[arg(long, help = "使用指定uid运行程序(unavailable on windows)")]
     uid: Option<u32>,
     #[arg(short, long, default_value = "4", help = "线程数量")]
     thread: u32,

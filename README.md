@@ -25,7 +25,7 @@ Options:
           从文件读取json格式
 
       --uid <UID>
-          使用指定uid运行程序(unavailable for window)
+          使用指定uid运行程序(unavailable on windows)
 
   -t, --thread <THREAD>
           线程数量
@@ -33,7 +33,7 @@ Options:
           [default: 4]
 
       --daemon
-          后台运行(unavailable for windows)
+          后台运行
 
   -l, --log <LOG>
           日志文件位置
@@ -80,6 +80,10 @@ Options:
 ```
 
 通过`--json`直接传入json字符串，或者使用`--json-file`指定json文件位置，在unix上也可使用管道传递，例如`cat 1.json | m3u8-dl`
+
+---
+
+当同时下载大量视频时，不能保证一个视频下载完成后才开始下载下一个视频，如果需要该效果，改为执行多条命令，或者`--thread 1`（可能会拖累下载效率）
 
 ## 构建
 
