@@ -26,16 +26,11 @@ pub struct Cli {
     #[arg(long, help = "从文件读取json格式")]
     json_file: Option<String>,
     #[cfg(any(target_os = "macos", target_os = "linux"))]
-    #[arg(long, help = "使用指定uid运行程序(unavailable for window)")]
+    #[arg(long, help = "使用指定uid运行程序(unavailable on window)")]
     uid: Option<u32>,
     #[arg(short, long, default_value = "4", help = "线程数量")]
     thread: u32,
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    #[arg(
-        long,
-        help = "后台运行(unavailable for windows)",
-        default_value = "false"
-    )]
+    #[arg(long, help = "后台运行", default_value = "false")]
     daemon: bool,
     #[arg(short, long, help = "日志文件位置")]
     log: Option<String>,
@@ -708,62 +703,86 @@ enum Task {
         count: Arc<AtomicU32>,
     },
 }
+
+#[cfg(target_os = "windows")]
+fn start_daemon(_opt: Opt) {
+    log::info!("the download task will continue on daemon");
+    use std::os::windows::process::CommandExt;
+    let args = std::env::args();
+    // 必须排除 --daemon 参数
+    let mut args = args.filter(|f| f != "--daemon").collect::<Vec<String>>();
+    let program = args.remove(0);
+    // https://rustwiki.org/zh-CN/std/os/windows/process/trait.CommandExt.html#tymethod.creation_flags
+    // 使用 CREATE_NEw_PROCESS_GROUP= 0x00000200，实际上不用这个也行，但是这个好像跟ctrl+c信号有关
+    std::process::Command::new(program)
+        .args(args)
+        .stdin(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .creation_flags(0x00000200)
+        .spawn()
+        .unwrap();
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn start_daemon(opt: Opt) {
+    unsafe {
+        let pid = libc::fork();
+        if pid > 0 {
+            // println!("父进程结束 {}", std::process::id());
+            log::info!("the download task will continue on daemon");
+            return;
+        } else if pid == 0 {
+            libc::setsid();
+            let _ = libc::close(0);
+            let _ = libc::close(1);
+            let _ = libc::close(2);
+            // 重定向输入输出到/dev/null，否则子进程的控制台输出依然会打印出来
+            let null = CString::new("/dev/null").unwrap();
+            let null_fd = libc::open(null.as_ptr() as *const libc::c_char, libc::O_RDWR);
+            if null_fd < 0 {
+                panic!("子进程启动失败");
+            }
+
+            libc::dup2(null_fd, libc::STDIN_FILENO);
+            libc::dup2(null_fd, libc::STDOUT_FILENO);
+            libc::dup2(null_fd, libc::STDERR_FILENO);
+
+            match opt.run() {
+                Ok(_) => {}
+                Err(e) => {
+                    log::error!("{e}");
+                    std::process::exit(101);
+                }
+            }
+            return;
+        } else {
+            log::error!("fork 失败");
+            return;
+        }
+    }
+}
 fn main() {
     let cli = Cli::parse();
 
-    let mut opt;
-    match Opt::new(&cli) {
-        Ok(v) => opt = v,
+    let opt = match Opt::new(&cli) {
+        Ok(v) => v,
         Err(e) => {
             log::error!("{e}");
             std::process::exit(101);
         }
-    }
-    log::info!("参数={:?}", cli);
+    };
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
     if cli.daemon {
-        unsafe {
-            let pid = libc::fork();
-            if pid > 0 {
-                // println!("父进程结束 {}", std::process::id());
-                log::info!("the download task will continue on daemon");
-                return;
-            } else if pid == 0 {
-                libc::setsid();
-                let _ = libc::close(0);
-                let _ = libc::close(1);
-                let _ = libc::close(2);
-                // 重定向输入输出到/dev/null，否则子进程的控制台输出依然会打印出来
-                let null = CString::new("/dev/null").unwrap();
-                let null_fd = libc::open(null.as_ptr() as *const libc::c_char, libc::O_RDWR);
-                if null_fd < 0 {
-                    panic!("子进程启动失败");
-                }
-
-                libc::dup2(null_fd, libc::STDIN_FILENO);
-                libc::dup2(null_fd, libc::STDOUT_FILENO);
-                libc::dup2(null_fd, libc::STDERR_FILENO);
-
-                match opt.run() {
-                    Ok(_) => {}
-                    Err(e) => {
-                        log::error!("{e}");
-                        std::process::exit(101);
-                    }
-                }
-                return;
-            } else {
-                log::error!("fork 失败");
-                return;
+        start_daemon(opt);
+        return;
+    } else {
+        match opt.run() {
+            Ok(_) => {}
+            Err(e) => {
+                log::error!("{e}");
+                std::process::exit(101);
             }
-        }
-    }
-    match opt.run() {
-        Ok(_) => {}
-        Err(e) => {
-            log::error!("{e}");
-            std::process::exit(101);
         }
     }
 }
