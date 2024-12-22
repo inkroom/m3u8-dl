@@ -850,16 +850,18 @@ fn aes128_cbc_decrypt(
 mod custom_log {
     use crate::Cli;
 
-    use std::io::Write;
+    use std::{io::Write, time::Duration};
     /// 时间戳转换，从1970年开始
     pub(crate) fn time_display(value: u64) -> String {
-        do_time_display(value, 1970)
+        do_time_display(value, 1970,Duration::from_secs(8 * 60 * 60))
     }
 
     /// 时间戳转换，支持从不同年份开始计算
-    pub(crate) fn do_time_display(value: u64, start_year: u64) -> String {
+    pub(crate) fn do_time_display(value: u64, start_year: u64,timezone:Duration) -> String {
         // 先粗略定位到哪一年
         // 以 365 来计算，年通常只会相比正确值更晚，剩下的秒数也就更多，并且有可能出现需要往前一年的情况
+        let value = value + timezone.as_secs();
+        
 
         let per_year_sec = 365 * 24 * 60 * 60; // 平年的秒数
 
@@ -917,7 +919,7 @@ mod custom_log {
             year,
             month,
             time,
-            hour + 8,
+            hour,
             min,
             sec
         )
