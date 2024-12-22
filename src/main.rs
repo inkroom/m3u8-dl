@@ -699,6 +699,7 @@ enum Task {
         path: String,
         dir: String,
         files: Arc<Vec<String>>,
+        index: usize,
         out: String,
         count: Arc<AtomicU32>,
     },
@@ -853,15 +854,14 @@ mod custom_log {
     use std::{io::Write, time::Duration};
     /// 时间戳转换，从1970年开始
     pub(crate) fn time_display(value: u64) -> String {
-        do_time_display(value, 1970,Duration::from_secs(8 * 60 * 60))
+        do_time_display(value, 1970, Duration::from_secs(8 * 60 * 60))
     }
 
     /// 时间戳转换，支持从不同年份开始计算
-    pub(crate) fn do_time_display(value: u64, start_year: u64,timezone:Duration) -> String {
+    pub(crate) fn do_time_display(value: u64, start_year: u64, timezone: Duration) -> String {
         // 先粗略定位到哪一年
         // 以 365 来计算，年通常只会相比正确值更晚，剩下的秒数也就更多，并且有可能出现需要往前一年的情况
         let value = value + timezone.as_secs();
-        
 
         let per_year_sec = 365 * 24 * 60 * 60; // 平年的秒数
 
@@ -916,12 +916,7 @@ mod custom_log {
 
         format!(
             "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
-            year,
-            month,
-            time,
-            hour,
-            min,
-            sec
+            year, month, time, hour, min, sec
         )
     }
     //
@@ -1130,6 +1125,7 @@ impl Opt {
                             path: file,
                             dir: dir.clone(),
                             files: Arc::clone(&files),
+                            index,
                             out: out.clone(),
                             count: std::sync::Arc::clone(&count),
                         });
@@ -1188,6 +1184,7 @@ impl Opt {
                         path,
                         dir,
                         files,
+                        index,
                         out,
                         count,
                     } => {
@@ -1200,6 +1197,7 @@ impl Opt {
                                 files.len()
                                     - count.load(std::sync::atomic::Ordering::SeqCst) as usize,
                                 files.len(),
+                                index,
                             ) {
                                 log::error!(
                             "download file fail ={url}, reason =[{e}] after retry {i} count"
@@ -1266,6 +1264,7 @@ impl Opt {
         dir: &str,
         now: usize,
         total: usize,
+        index: usize,
     ) -> Result<(), String> {
         log::info!("url = {url} path={path} {now}/{total}");
         if std::fs::exists(path).unwrap_or(false) {
@@ -1279,7 +1278,7 @@ impl Opt {
             Err((e, status)) => {
                 if status == 404 && self.replace_not_found {
                     // 找到最近的下载成功的ts文件，就是上一个
-                    for i in (0..now - 1).rev() {
+                    for i in (0..index).rev() {
                         let p = Path::system(path).pop().join(format!("{i}.ts").as_str());
                         if std::fs::exists(p.to_string().as_str()).unwrap_or(false)
                             && std::fs::copy(p.to_string().as_str(), path).is_ok()
