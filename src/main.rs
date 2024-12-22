@@ -1288,6 +1288,7 @@ impl Opt {
                                 "file {path} not found, use the file [{}] replace it",
                                 p.to_string()
                             );
+                            break;
                         }
                     }
                 } else {
