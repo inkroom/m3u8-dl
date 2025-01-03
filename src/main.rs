@@ -16,6 +16,8 @@ pub struct Cli {
     dir: Option<String>,
     #[arg(short, long, help = "输出文件名，必须以mp4或者mkv结尾")]
     name: Option<String>,
+    #[arg(long, help = "排除部分ts文件")]
+    exclude: Option<String>,
     #[arg(
         short,
         long,
@@ -94,6 +96,7 @@ impl Cli {
                 self.name.clone().unwrap().as_str(),
                 self.dir.clone().unwrap().as_str(),
                 self.url.clone().unwrap().as_str(),
+                self.exclude.clone(),
             )?])
         } else {
             #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -121,10 +124,16 @@ struct Item {
     name: String,
     dir: String,
     url: String,
+    exclude: Option<String>,
 }
 
 impl Item {
-    pub(crate) fn new(name: &str, dir: &str, url: &str) -> Result<Self, String> {
+    pub(crate) fn new(
+        name: &str,
+        dir: &str,
+        url: &str,
+        exclude: Option<String>,
+    ) -> Result<Self, String> {
         if !name.ends_with(".mp4") && !name.ends_with(".mkv") {
             Err("name 必须有文件格式".to_string())
         } else {
@@ -132,6 +141,7 @@ impl Item {
                 name: name.to_string(),
                 dir: dir.to_string(),
                 url: url.to_string(),
+                exclude,
             })
         }
     }
@@ -181,6 +191,7 @@ mod json {
         name: Option<String>,
         dir: Option<String>,
         url: Option<String>,
+        exclude: Option<String>,
     }
 
     impl TempValue {
@@ -197,12 +208,14 @@ mod json {
                 self.name.clone().unwrap().as_str(),
                 self.dir.clone().unwrap().as_str(),
                 self.url.clone().unwrap().as_str(),
+                self.exclude.clone(),
             )
         }
         fn clear(&mut self) {
             self.name = None;
             self.dir = None;
             self.url = None;
+            self.exclude = None;
         }
     }
     ///
@@ -219,6 +232,7 @@ mod json {
             name: None,
             dir: None,
             url: None,
+            exclude: None,
         };
         let mut key = None;
         while now < s.len() {
@@ -275,17 +289,22 @@ mod json {
                                         return Err(format!("Duplicate object key [{}]", t));
                                     }
                                     item.url = Some(temp);
+                                } else if t == "e" {
+                                    if item.exclude.is_some() {
+                                        return Err(format!("Duplicate object key [{}]", t));
+                                    }
+                                    item.exclude = Some(temp);
                                 } else {
                                     return Err(format!("unsupport key: {t}"));
                                 }
                                 key = None;
-                                if item.is_complete() {
-                                    // 读完一个item，再多的key，这里也不支持了
-                                    except = VALUE_COMMA | VALUE_LARGE_RIGHT | VALUE_SPACE;
-                                } else {
-                                    // 读完一对kv，但是还不够一个item，说明应该继续读一个key，
-                                    except = VALUE_COMMA | VALUE_SPACE;
-                                }
+                                // if item.is_complete() && item.exclude.is_some() {
+                                // 读完一对kv，接着可以是k，也可以是结束
+                                except = VALUE_COMMA | VALUE_LARGE_RIGHT | VALUE_SPACE;
+                                // } else {
+                                //     // 读完一对kv，但是还不够一个item，说明应该继续读一个key，
+                                //     except = VALUE_COMMA | VALUE_SPACE;
+                                // }
                             }
                             break;
                         }
@@ -302,8 +321,16 @@ mod json {
                         // 已经读完了一个item
                         except = VALUE_MIDDLE_RIGHT | VALUE_LARGE_LEFT | VALUE_SPACE;
                     } else {
-                        // 应该读key
-                        except = VALUE_QUOTE | VALUE_SPACE;
+                        if item.is_complete() && item.exclude.is_some() {
+                            // 完成了
+                            except = VALUE_LARGE_RIGHT | VALUE_SPACE;
+                        } else if item.is_complete() && item.exclude.is_none() {
+                            // 只有可选的exclude属性
+                            except = VALUE_QUOTE | VALUE_LARGE_RIGHT | VALUE_SPACE
+                        } else {
+                            // 必填的还没有，应该读key
+                            except = VALUE_QUOTE | VALUE_SPACE;
+                        }
                     }
                 }
                 VALUE_LARGE_RIGHT => {
@@ -363,6 +390,7 @@ mod json {
             assert_eq!("name.mp4", s[0].name);
             assert_eq!("d", s[0].dir);
             assert_eq!("url", s[0].url);
+            assert_eq!(None, s[0].exclude);
 
             let v = r#"[{"n":"name.mp4","u":"url","d":"d"}]"#;
             let s = read_json(v).unwrap();
@@ -432,6 +460,18 @@ mod json {
             assert_eq!("name.mp4", s[0].name);
             assert_eq!("d", s[0].dir);
             assert_eq!("url", s[0].url);
+        }
+
+        #[test]
+        fn exclude() {
+            let v = r#"[{"n" : "name.mp4", "u":"url","d":"d","e":"12",},{"n" : "name.mp4", "u":"url","d":"211","e":"122"}]"#;
+            let s = read_json(v).unwrap();
+            assert_eq!(2, s.len());
+            assert_eq!("name.mp4", s[0].name);
+            assert_eq!("d", s[0].dir);
+            assert_eq!("url", s[0].url);
+            assert_eq!("12", s[0].exclude.as_ref().unwrap());
+            assert_eq!("122", s[1].exclude.as_ref().unwrap());
         }
     }
 }
@@ -692,6 +732,7 @@ enum Task {
         name: String,
         url: String,
         dir: String,
+        exclude: Option<String>,
     },
     Ts {
         key: Option<m3u8_rs::Key>,
@@ -1090,6 +1131,7 @@ impl Opt {
         name: String,
         url: String,
         dir: String,
+        exclude: Option<String>,
     ) -> Result<bool, String> {
         // log::debug!("thread {i} {url}",);
         let out = format!("{}/{}", dir, name);
@@ -1107,18 +1149,25 @@ impl Opt {
                         log::error!("create dir fail {e}");
                         return Err("fail".to_string());
                     };
+                    let mut nts: Vec<(usize, (Option<m3u8_rs::Key>, String, String))> = ts
+                        .into_iter()
+                        .enumerate()
+                        .map(|(index, v)| {
+                            (index + 1, (v.0, v.1, format!("{dir}/{}.ts", index + 1)))
+                        })
+                        .collect();
 
-                    let files: Arc<Vec<String>> = Arc::new(
-                        ts.iter()
-                            .enumerate()
-                            .map(|(index, _)| format!("{dir}/{}.ts", index + 1))
-                            .collect(),
-                    );
-                    let mut index = 0;
+                    if let Some(ex) = &exclude {
+                        let temp = ex.split(",").collect::<Vec<&str>>();
+                        nts = nts
+                            .into_iter()
+                            .filter(|(index, _)| !temp.contains(&format!("{}", index).as_str()))
+                            .collect();
+                    }
+                    let files: Arc<Vec<String>> =
+                        Arc::new(nts.iter().map(|(_, (_, _, file))| file.clone()).collect());
                     let count = std::sync::Arc::new(AtomicU32::new(files.len() as u32));
-                    for (key, url) in ts {
-                        index += 1;
-                        let file = format!("{dir}/{}.ts", index);
+                    for (index, (key, url, file)) in nts {
                         sender.send(Task::Ts {
                             key,
                             url,
@@ -1166,18 +1215,21 @@ impl Opt {
                 }
 
                 match *task {
-                    Task::M3u8 { name, url, dir } => {
-                        match Self::start_m3u8(&se2, sender, name, url, dir) {
-                            Ok(started) => {
-                                if !started {
-                                    finish_m3u8(&m3u8_count, sender);
-                                }
-                            }
-                            Err(_) => {
+                    Task::M3u8 {
+                        name,
+                        url,
+                        dir,
+                        exclude,
+                    } => match Self::start_m3u8(&se2, sender, name, url, dir, exclude) {
+                        Ok(started) => {
+                            if !started {
                                 finish_m3u8(&m3u8_count, sender);
                             }
                         }
-                    }
+                        Err(_) => {
+                            finish_m3u8(&m3u8_count, sender);
+                        }
+                    },
                     Task::Ts {
                         key,
                         url,
@@ -1225,7 +1277,7 @@ impl Opt {
                 name: ele.name.clone(),
                 url: ele.url.clone(),
                 dir: ele.dir.clone(),
-                // client: Arc::clone(&client),
+                exclude: ele.exclude.clone(),
             });
         }
 
