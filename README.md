@@ -18,6 +18,12 @@ Options:
   -n, --name <NAME>
           输出文件名，必须以mp4或者mkv结尾
 
+      --exclude <EXCLUDE>
+          排除部分ts文件；json key=[e]
+
+      --prefix <PREFIX>
+          使用file协议时用于指定ts文件前缀；json key=[p]
+
   -j, --json <JSON>
           读取json格式，例如[{"n":"1.mp4","u":"http://demo.com/1.m3u8","d":"/root"}]
 

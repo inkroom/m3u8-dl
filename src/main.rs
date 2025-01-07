@@ -16,8 +16,10 @@ pub struct Cli {
     dir: Option<String>,
     #[arg(short, long, help = "输出文件名，必须以mp4或者mkv结尾")]
     name: Option<String>,
-    #[arg(long, help = "排除部分ts文件")]
+    #[arg(long, help = "排除部分ts文件；json key=[e]")]
     exclude: Option<String>,
+    #[arg(long, help = "使用file协议时用于指定ts文件前缀；json key=[p]")]
+    prefix: Option<String>,
     #[arg(
         short,
         long,
@@ -97,6 +99,7 @@ impl Cli {
                 self.dir.clone().unwrap().as_str(),
                 self.url.clone().unwrap().as_str(),
                 self.exclude.clone(),
+                self.prefix.clone(),
             )?])
         } else {
             #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -125,6 +128,7 @@ struct Item {
     dir: String,
     url: String,
     exclude: Option<String>,
+    prefix: Option<String>,
 }
 
 impl Item {
@@ -133,6 +137,7 @@ impl Item {
         dir: &str,
         url: &str,
         exclude: Option<String>,
+        prefix: Option<String>,
     ) -> Result<Self, String> {
         if !name.ends_with(".mp4") && !name.ends_with(".mkv") {
             Err("name 必须有文件格式".to_string())
@@ -142,6 +147,7 @@ impl Item {
                 dir: dir.to_string(),
                 url: url.to_string(),
                 exclude,
+                prefix,
             })
         }
     }
@@ -192,6 +198,7 @@ mod json {
         dir: Option<String>,
         url: Option<String>,
         exclude: Option<String>,
+        prefix: Option<String>,
     }
 
     impl TempValue {
@@ -209,6 +216,7 @@ mod json {
                 self.dir.clone().unwrap().as_str(),
                 self.url.clone().unwrap().as_str(),
                 self.exclude.clone(),
+                self.prefix.clone(),
             )
         }
         fn clear(&mut self) {
@@ -216,6 +224,7 @@ mod json {
             self.dir = None;
             self.url = None;
             self.exclude = None;
+            self.prefix = None;
         }
     }
     ///
@@ -233,6 +242,7 @@ mod json {
             dir: None,
             url: None,
             exclude: None,
+            prefix: None,
         };
         let mut key = None;
         while now < s.len() {
@@ -294,6 +304,11 @@ mod json {
                                         return Err(format!("Duplicate object key [{}]", t));
                                     }
                                     item.exclude = Some(temp);
+                                } else if t == "p" {
+                                    if item.prefix.is_some() {
+                                        return Err(format!("Duplicate object key [{}]", t));
+                                    }
+                                    item.prefix = Some(temp);
                                 } else {
                                     return Err(format!("unsupport key: {t}"));
                                 }
@@ -321,12 +336,12 @@ mod json {
                         // 已经读完了一个item
                         except = VALUE_MIDDLE_RIGHT | VALUE_LARGE_LEFT | VALUE_SPACE;
                     } else {
-                        if item.is_complete() && item.exclude.is_some() {
+                        if item.is_complete() && (item.exclude.is_none() || item.prefix.is_none()) {
+                            // 只有可选的属性
+                            except = VALUE_QUOTE | VALUE_LARGE_RIGHT | VALUE_SPACE
+                        } else if item.is_complete() {
                             // 完成了
                             except = VALUE_LARGE_RIGHT | VALUE_SPACE;
-                        } else if item.is_complete() && item.exclude.is_none() {
-                            // 只有可选的exclude属性
-                            except = VALUE_QUOTE | VALUE_LARGE_RIGHT | VALUE_SPACE
                         } else {
                             // 必填的还没有，应该读key
                             except = VALUE_QUOTE | VALUE_SPACE;
@@ -437,6 +452,15 @@ mod json {
             assert_eq!("name.mp4", s[0].name);
             assert_eq!("d", s[0].dir);
             assert_eq!("url", s[0].url);
+
+            let v = r#"[{"n" : "name.mp4", "u":"url","d":"d","p":"pP"},{"n" : "name.mp4", "u":"url","d":"d"}]"#;
+            let s = read_json(v).unwrap();
+            assert_eq!(2, s.len());
+            assert_eq!("name.mp4", s[0].name);
+            assert_eq!("d", s[0].dir);
+            assert_eq!("url", s[0].url);
+            assert_eq!("pP", s[0].prefix.as_ref().unwrap());
+            assert_eq!(None, s[1].prefix);
         }
 
         #[test]
@@ -733,6 +757,7 @@ enum Task {
         url: String,
         dir: String,
         exclude: Option<String>,
+        prefix: Option<String>,
     },
     Ts {
         key: Option<m3u8_rs::Key>,
@@ -991,7 +1016,7 @@ mod custom_log {
                 console: std::io::stdout(),
                 fs: opt.log.as_ref().map(|f| {
                     let t = crate::Path::system(f.as_str()).pop();
-                    if !std::fs::exists( t.to_string()).unwrap_or(false){
+                    if !std::fs::exists(t.to_string()).unwrap_or(false) {
                         std::fs::create_dir_all(t.to_string()).unwrap();
                     }
 
@@ -1087,6 +1112,7 @@ impl Opt {
         &self,
         url: &str,
         uri: &str,
+        prefix: Option<&str>,
     ) -> Result<Vec<(Option<m3u8_rs::Key>, String)>, String> {
         let m3u8_url = url::Url::parse(url)
             .and_then(|f| f.join(uri))
@@ -1099,9 +1125,11 @@ impl Opt {
                     Ok(Playlist::MasterPlaylist(m)) => {
                         let mut v = Vec::new();
                         for ele in &m.variants {
-                            v.append(
-                                &mut self.get_m3u8_ts_url(m3u8_url.as_str(), ele.uri.as_str())?,
-                            );
+                            v.append(&mut self.get_m3u8_ts_url(
+                                m3u8_url.as_str(),
+                                ele.uri.as_str(),
+                                prefix.clone(),
+                            )?);
                         }
                         Ok(v)
                     }
@@ -1116,7 +1144,11 @@ impl Opt {
                             .map(|f| {
                                 (
                                     key.clone(),
-                                    Self::get_real_url(m3u8_url.as_str(), f.uri.as_str()),
+                                    Self::get_real_url(
+                                        m3u8_url.as_str(),
+                                        f.uri.as_str(),
+                                        prefix.clone(),
+                                    ),
                                 )
                             })
                             .filter(|f| f.1.is_ok())
@@ -1137,6 +1169,7 @@ impl Opt {
         url: String,
         dir: String,
         exclude: Option<String>,
+        prefix: Option<&str>,
     ) -> Result<bool, String> {
         // log::debug!("thread {i} {url}",);
         let out = format!("{}/{}", dir, name);
@@ -1148,7 +1181,7 @@ impl Opt {
         }
 
         for c in 0..se2.thread {
-            match se2.get_m3u8_ts_url(url.as_str(), "") {
+            match se2.get_m3u8_ts_url(url.as_str(), "", prefix) {
                 Ok(ts) => {
                     if let Err(e) = std::fs::create_dir_all(dir.as_str()) {
                         log::error!("create dir fail {e}");
@@ -1225,7 +1258,16 @@ impl Opt {
                         url,
                         dir,
                         exclude,
-                    } => match Self::start_m3u8(&se2, sender, name, url, dir, exclude) {
+                        prefix,
+                    } => match Self::start_m3u8(
+                        &se2,
+                        sender,
+                        name,
+                        url,
+                        dir,
+                        exclude,
+                        prefix.as_ref().map(|f| f.as_str()),
+                    ) {
                         Ok(started) => {
                             if !started {
                                 finish_m3u8(&m3u8_count, sender);
@@ -1283,6 +1325,7 @@ impl Opt {
                 url: ele.url.clone(),
                 dir: ele.dir.clone(),
                 exclude: ele.exclude.clone(),
+                prefix: ele.prefix.clone(),
             });
         }
 
@@ -1295,11 +1338,11 @@ impl Opt {
         Ok(())
     }
 
-    fn get_real_url(m3u8: &str, uri: &str) -> Result<String, String> {
+    fn get_real_url(m3u8: &str, uri: &str, prefix: Option<&str>) -> Result<String, String> {
         if uri.starts_with("http") {
             Ok(uri.to_string())
         } else {
-            let url = url::Url::parse(m3u8).map_err(|e| e.to_string())?;
+            let url = url::Url::parse(prefix.unwrap_or(m3u8)).map_err(|e| e.to_string())?;
 
             url.join(uri)
                 .map_or_else(|e| Err(e.to_string()), |f| Ok(f.as_str().to_string()))
@@ -1307,6 +1350,11 @@ impl Opt {
     }
 
     fn download_inner(&self, url: &str) -> Result<Vec<u8>, (String, u16)> {
+        if url.starts_with("file://") {
+            // 文件协议
+            return std::fs::read(url.replace("file://", "")).map_err(|e| (e.to_string(), 500));
+        }
+
         match &self.client {
             Some(c) => c.get(url),
             None => unreachable!(),
