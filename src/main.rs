@@ -890,7 +890,7 @@ fn aes128_cbc_decrypt(
 }
 
 mod custom_log {
-    use crate::Cli;
+    use crate::{Cli, Path};
 
     use std::{io::Write, time::Duration};
     /// 时间戳转换，从1970年开始
@@ -990,6 +990,11 @@ mod custom_log {
             Writer {
                 console: std::io::stdout(),
                 fs: opt.log.as_ref().map(|f| {
+                    let t = crate::Path::system(f.as_str()).pop();
+                    if !std::fs::exists( t.to_string()).unwrap_or(false){
+                        std::fs::create_dir_all(t.to_string()).unwrap();
+                    }
+
                     std::fs::OpenOptions::new()
                         .create(true)
                         .append(true)
