@@ -1558,7 +1558,13 @@ impl Path {
 
     pub fn join(&self, path: &str) -> Self {
         let mut s = self.clone();
-
+        let mut path = path;
+        if let Some(t) = self.paths.last() {
+            if t.is_empty() && path.starts_with(s.sep.as_str()) {
+                path = &path[1..];
+                s.paths.pop();
+            }
+        }
         let v = path.split(s.sep.as_str());
         for ele in v {
             if ele == ".." {
@@ -1623,5 +1629,11 @@ mod tests {
         // .unwrap();
 
         // println!("scope over")
+    }
+
+    #[test]
+    fn path(){
+        let v = Path::system("/v/").join("/ok");
+        assert_eq!("/v/ok",v.to_string());
     }
 }
