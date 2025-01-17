@@ -24,6 +24,9 @@ Options:
       --prefix <PREFIX>
           使用file协议时用于指定ts文件前缀；json key=[p]
 
+      --header <HEADER>
+          请求头，用法同curl
+
   -j, --json <JSON>
           读取json格式，例如[{"n":"1.mp4","u":"http://demo.com/1.m3u8","d":"/root"}]
 

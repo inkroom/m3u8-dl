@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::atomic::AtomicU32;
 use std::time::SystemTime;
@@ -20,6 +21,8 @@ pub struct Cli {
     exclude: Option<String>,
     #[arg(long, help = "使用file协议时用于指定ts文件前缀；json key=[p]")]
     prefix: Option<String>,
+    #[arg(long, help = "请求头，用法同curl")]
+    header: Vec<String>,
     #[arg(
         short,
         long,
@@ -84,15 +87,35 @@ impl Debug for Cli {
             .finish()
     }
 }
+
+fn parse_header(headers: Vec<String>) -> HashMap<String, String> {
+    let mut h = HashMap::new();
+    for ele in headers {
+        let t: Vec<_> = ele.split(":").collect();
+        h.insert(
+            t[0].trim().to_string(),
+            t[1..].join(":").trim().to_string()
+        );
+    }
+    h
+}
+
 impl Cli {
     pub(crate) fn get_m3u8(&self) -> Result<Vec<Item>, String> {
+        let header = parse_header(self.header.clone());
         if let Some(json) = &self.json {
             json::read_json(json.as_str())
         } else if let Some(f) = &self.json_file {
             let v = std::fs::read(f.as_str())
                 .map_err(|e| format!("read json_file fail, reason:{}", e))
                 .and_then(|v| String::from_utf8(v).map_err(|_e| format!("only support utf8")))?;
-            json::read_json(v.as_str())
+            match json::read_json(v.as_str()) {
+                Ok(mut t) => {
+                    t.iter_mut().for_each(|f| f.set_header(header.clone()));
+                    Ok(t)
+                }
+                Err(e) => Err(e),
+            }
         } else if self.url.is_some() && self.name.is_some() && self.dir.is_some() {
             Ok(vec![Item::new(
                 self.name.clone().unwrap().as_str(),
@@ -100,6 +123,7 @@ impl Cli {
                 self.url.clone().unwrap().as_str(),
                 self.exclude.clone(),
                 self.prefix.clone(),
+                header,
             )?])
         } else {
             #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -115,7 +139,13 @@ impl Cli {
 
                 if let Ok(_) = stdin.read_to_string(&mut v) {
                     log::debug!("read from stdin,value={v}");
-                    return json::read_json(v.as_str());
+                    return match json::read_json(v.as_str()) {
+                        Ok(mut t) => {
+                            t.iter_mut().for_each(|f| f.set_header(header.clone()));
+                            Ok(t)
+                        }
+                        Err(e) => Err(e),
+                    };
                 }
             }
 
@@ -129,6 +159,7 @@ struct Item {
     url: String,
     exclude: Option<String>,
     prefix: Option<String>,
+    header: HashMap<String, String>,
 }
 
 impl Item {
@@ -138,6 +169,7 @@ impl Item {
         url: &str,
         exclude: Option<String>,
         prefix: Option<String>,
+        header: HashMap<String, String>,
     ) -> Result<Self, String> {
         if !name.ends_with(".mp4") && !name.ends_with(".mkv") {
             Err("name 必须有文件格式".to_string())
@@ -148,8 +180,13 @@ impl Item {
                 url: url.to_string(),
                 exclude,
                 prefix,
+                header: header,
             })
         }
+    }
+
+    pub(crate) fn set_header(&mut self, header: HashMap<String, String>) {
+        self.header = header;
     }
 }
 
@@ -168,6 +205,8 @@ struct Opt {
 }
 
 mod json {
+    use std::collections::HashMap;
+
     use crate::Item;
 
     /// 左中括号 [
@@ -217,6 +256,7 @@ mod json {
                 self.url.clone().unwrap().as_str(),
                 self.exclude.clone(),
                 self.prefix.clone(),
+                HashMap::new(),
             )
         }
         fn clear(&mut self) {
@@ -635,11 +675,13 @@ pub trait HttpClient: Send {
     where
         Self: Sized;
 
-    fn get(&self, url: &str) -> Result<Vec<u8>, (String, u16)>;
+    fn get(&self, url: &str, header: HashMap<String, String>) -> Result<Vec<u8>, (String, u16)>;
 }
 
 #[cfg(feature = "ureq")]
 mod ureqclient {
+    use std::collections::HashMap;
+
     use crate::{Cli, HttpClient};
 
     pub(crate) struct UReqClient {
@@ -666,8 +708,16 @@ mod ureqclient {
             Ok(UReqClient { inner: bu.build() })
         }
 
-        fn get(&self, url: &str) -> Result<Vec<u8>, (String, u16)> {
-            let v = self.inner.get(url).call().map_err(|e| {
+        fn get(
+            &self,
+            url: &str,
+            header: HashMap<String, String>,
+        ) -> Result<Vec<u8>, (String, u16)> {
+            let mut v = self.inner.get(url);
+            for (key, value) in header.iter() {
+                v = v.set(&key, &value);
+            }
+            let v = v.call().map_err(|e| {
                 (
                     format!("request error ={}", e),
                     e.into_response().map(|f| f.status()).unwrap_or(0),
@@ -694,6 +744,8 @@ mod ureqclient {
 }
 #[cfg(feature = "west")]
 mod reqwestclient {
+    use std::collections::HashMap;
+
     use crate::HttpClient;
 
     pub struct ReqWestClient {
@@ -727,8 +779,12 @@ mod reqwestclient {
                 .map_err(|f| format!("init fail {f}"))
         }
 
-        fn get(&self, url: &str) -> Result<Vec<u8>, (String, u16)> {
-            match self.inner.get(url).send().map_err(|e| e.to_string()) {
+        fn get(&self, url: &str, header: HashMap<String, String>) -> Result<Vec<u8>, (String, u16)> {
+            let mut v = self.inner.get(url);
+            for (key,value) in header {
+                v = v.header(key, value);
+            }
+            match v.send().map_err(|e| e.to_string()) {
                 Ok(v) => {
                     let status = v.status();
                     if status.is_success() {
@@ -758,6 +814,7 @@ enum Task {
         dir: String,
         exclude: Option<String>,
         prefix: Option<String>,
+        header: HashMap<String, String>,
     },
     Ts {
         key: Option<m3u8_rs::Key>,
@@ -768,6 +825,7 @@ enum Task {
         index: usize,
         out: String,
         count: Arc<AtomicU32>,
+        header: HashMap<String, String>,
     },
 }
 
@@ -1113,13 +1171,14 @@ impl Opt {
         url: &str,
         uri: &str,
         prefix: Option<&str>,
+        header: HashMap<String, String>,
     ) -> Result<Vec<(Option<m3u8_rs::Key>, String)>, String> {
         let m3u8_url = url::Url::parse(url)
             .and_then(|f| f.join(uri))
             .map_err(|e| format!("m3u8 url not valid {}", e))?;
         log::info!("downloading m3u8 {}", m3u8_url);
 
-        match self.download_inner(m3u8_url.as_str()) {
+        match self.download_inner(m3u8_url.as_str(), header.clone()) {
             Ok(v) => {
                 match m3u8_rs::parse_playlist_res(v.as_ref()) {
                     Ok(Playlist::MasterPlaylist(m)) => {
@@ -1129,6 +1188,7 @@ impl Opt {
                                 m3u8_url.as_str(),
                                 ele.uri.as_str(),
                                 prefix.clone(),
+                                header.clone(),
                             )?);
                         }
                         Ok(v)
@@ -1170,6 +1230,7 @@ impl Opt {
         dir: String,
         exclude: Option<String>,
         prefix: Option<&str>,
+        header: HashMap<String, String>,
     ) -> Result<bool, String> {
         // log::debug!("thread {i} {url}",);
         let out = format!("{}/{}", dir, name);
@@ -1181,7 +1242,7 @@ impl Opt {
         }
 
         for c in 0..se2.thread {
-            match se2.get_m3u8_ts_url(url.as_str(), "", prefix) {
+            match se2.get_m3u8_ts_url(url.as_str(), "", prefix, header.clone()) {
                 Ok(ts) => {
                     if let Err(e) = std::fs::create_dir_all(dir.as_str()) {
                         log::error!("create dir fail {e}");
@@ -1215,6 +1276,7 @@ impl Opt {
                             index,
                             out: out.clone(),
                             count: std::sync::Arc::clone(&count),
+                            header: header.clone(),
                         });
                     }
                     return Ok(true);
@@ -1259,6 +1321,7 @@ impl Opt {
                         dir,
                         exclude,
                         prefix,
+                        header,
                     } => match Self::start_m3u8(
                         &se2,
                         sender,
@@ -1267,6 +1330,7 @@ impl Opt {
                         dir,
                         exclude,
                         prefix.as_ref().map(|f| f.as_str()),
+                        header,
                     ) {
                         Ok(started) => {
                             if !started {
@@ -1286,6 +1350,7 @@ impl Opt {
                         index,
                         out,
                         count,
+                        header,
                     } => {
                         for i in 0..se2.retry {
                             if let Err(e) = se2.download_item(
@@ -1297,6 +1362,7 @@ impl Opt {
                                     - count.load(std::sync::atomic::Ordering::SeqCst) as usize,
                                 files.len(),
                                 index,
+                                header.clone(),
                             ) {
                                 log::error!(
                             "download file fail ={url}, reason =[{e}] after retry {i} count"
@@ -1326,6 +1392,7 @@ impl Opt {
                 dir: ele.dir.clone(),
                 exclude: ele.exclude.clone(),
                 prefix: ele.prefix.clone(),
+                header: ele.header.clone(),
             });
         }
 
@@ -1349,14 +1416,18 @@ impl Opt {
         }
     }
 
-    fn download_inner(&self, url: &str) -> Result<Vec<u8>, (String, u16)> {
+    fn download_inner(
+        &self,
+        url: &str,
+        header: HashMap<String, String>,
+    ) -> Result<Vec<u8>, (String, u16)> {
         if url.starts_with("file://") {
             // 文件协议
             return std::fs::read(url.replace("file://", "")).map_err(|e| (e.to_string(), 500));
         }
-
+        log::debug!("headers={:?}",header);
         match &self.client {
-            Some(c) => c.get(url),
+            Some(c) => c.get(url, header),
             None => unreachable!(),
         }
     }
@@ -1370,14 +1441,15 @@ impl Opt {
         now: usize,
         total: usize,
         index: usize,
+        header: HashMap<String, String>,
     ) -> Result<(), String> {
         log::info!("url = {url} path={path} {now}/{total}");
         if std::fs::exists(path).unwrap_or(false) {
             return Ok(());
         }
-        match self.download_inner(url) {
+        match self.download_inner(url, header.clone()) {
             Ok(v) => {
-                let v = self.decrypt(key, &v, dir)?;
+                let v = self.decrypt(key, &v, dir, header)?;
                 std::fs::write(path, &v[self.skip..]).map_err(|e| e.to_string())?;
             }
             Err((e, status)) => {
@@ -1412,6 +1484,7 @@ impl Opt {
         key: &Option<m3u8_rs::Key>,
         value: &[u8],
         dir: &str,
+        header: HashMap<String, String>,
     ) -> Result<Vec<u8>, String> {
         if let Some(key) = key {
             match &key.method {
@@ -1445,7 +1518,7 @@ impl Opt {
                                     .or_else(|_| {
                                         log::debug!("download the key file from uri = {uri}");
                                         // 读取uri
-                                        self.download_inner(uri).map(|f| {
+                                        self.download_inner(uri, header).map(|f| {
                                             let _ = std::fs::write(path.as_str(), f.as_slice());
                                             f.to_vec()
                                         })
@@ -1632,8 +1705,8 @@ mod tests {
     }
 
     #[test]
-    fn path(){
+    fn path() {
         let v = Path::system("/v/").join("/ok");
-        assert_eq!("/v/ok",v.to_string());
+        assert_eq!("/v/ok", v.to_string());
     }
 }
