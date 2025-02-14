@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::fmt::Debug;
+use std::ops::Deref;
 use std::sync::atomic::AtomicU32;
 use std::time::SystemTime;
 use std::{ffi::CString, sync::Arc};
@@ -807,6 +808,29 @@ mod reqwestclient {
     }
 }
 
+pub(crate) struct Key{
+    uri:Option<String>,
+    key:m3u8_rs::Key
+}
+
+impl Key{
+    pub(crate) fn new(key:Option<m3u8_rs::Key>,m3u8_url:&str)->Option<Self>{
+
+        key.map(|key|Self{
+            uri: key.uri.as_ref().and_then(|f|url::Url::parse(m3u8_url).and_then(|v|v.join(f.as_str())).ok()).map(|f|f.as_str().to_string()),
+            key
+        })
+    }
+}
+
+impl Deref for Key{
+    type Target=m3u8_rs::Key;
+
+    fn deref(&self) -> &Self::Target {
+        &self.key
+    }
+}
+
 enum Task {
     M3u8 {
         name: String,
@@ -817,7 +841,7 @@ enum Task {
         header: HashMap<String, String>,
     },
     Ts {
-        key: Option<m3u8_rs::Key>,
+        key: Option<Key>,
         url: String,
         path: String,
         dir: String,
@@ -1172,7 +1196,7 @@ impl Opt {
         uri: &str,
         prefix: Option<&str>,
         header: HashMap<String, String>,
-    ) -> Result<Vec<(Option<m3u8_rs::Key>, String)>, String> {
+    ) -> Result<Vec<(Option<Key>, String)>, String> {
         let m3u8_url = url::Url::parse(url)
             .and_then(|f| f.join(uri))
             .map_err(|e| format!("m3u8 url not valid {}", e))?;
@@ -1212,8 +1236,8 @@ impl Opt {
                                 )
                             })
                             .filter(|f| f.1.is_ok())
-                            .map(|f| (f.0, f.1.unwrap().to_string()))
-                            .collect::<Vec<(Option<m3u8_rs::Key>, String)>>())
+                            .map(|f| ( Key::new(f.0, url) , f.1.unwrap().to_string()))
+                            .collect::<Vec<(Option<Key>, String)>>())
                     }
                     Err(e) => Err(e.to_string()),
                 }
@@ -1248,7 +1272,7 @@ impl Opt {
                         log::error!("create dir fail {e}");
                         return Err("fail".to_string());
                     };
-                    let mut nts: Vec<(usize, (Option<m3u8_rs::Key>, String, String))> = ts
+                    let mut nts: Vec<(usize, (Option<Key>, String, String))> = ts
                         .into_iter()
                         .enumerate()
                         .map(|(index, v)| {
@@ -1434,7 +1458,7 @@ impl Opt {
 
     fn download_item(
         &self,
-        key: &Option<m3u8_rs::Key>,
+        key: &Option<Key>,
         url: &str,
         path: &str,
         dir: &str,
@@ -1481,7 +1505,7 @@ impl Opt {
 
     fn decrypt<'a>(
         &self,
-        key: &Option<m3u8_rs::Key>,
+        key: &Option<Key>,
         value: &[u8],
         dir: &str,
         header: HashMap<String, String>,
