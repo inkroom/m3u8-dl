@@ -1644,7 +1644,7 @@ impl Path {
         // for ele in v {
         //     paths.push(ele.to_string());
         // }
-
+        
         Self {
             paths: Vec::new(),
             sep: sep.to_string(),
@@ -1680,7 +1680,7 @@ impl Path {
         // if self.is_absolute {
         //     format!("/{}",self.paths.join(&self.sep))
         // }else{
-        self.paths.join(&self.sep)
+        self.paths.join(&self.sep).replace(format!("{}{}",self.sep,self.sep).as_str(),format!("{}",self.sep).as_str())
         // }
     }
     pub fn pop(&self) -> Self {
@@ -1731,6 +1731,8 @@ mod tests {
     #[test]
     fn path() {
         let v = Path::system("/v/").join("/ok");
+        assert_eq!("/v/ok", v.to_string());
+        let v = Path::system("/v/").join("ok");
         assert_eq!("/v/ok", v.to_string());
     }
 }
