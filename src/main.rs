@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::fmt::Debug;
+use std::io::Write;
 use std::ops::Deref;
 use std::sync::atomic::AtomicU32;
 use std::time::SystemTime;
@@ -66,7 +67,13 @@ pub struct Cli {
         default_value = "false"
     )]
     replace_not_found: bool,
-
+    #[arg(
+        long,
+        default_value = "false",
+        help = "使用临时文件",
+        long_help = "当文件数过多导致合并失败时，可以使用该参数借助临时文件合并视频"
+    )]
+    temp: bool,
     #[arg(short, long, default_value = "false", help = "输出更多日志")]
     verbose: bool,
 }
@@ -93,10 +100,7 @@ fn parse_header(headers: Vec<String>) -> HashMap<String, String> {
     let mut h = HashMap::new();
     for ele in headers {
         let t: Vec<_> = ele.split(":").collect();
-        h.insert(
-            t[0].trim().to_string(),
-            t[1..].join(":").trim().to_string()
-        );
+        h.insert(t[0].trim().to_string(), t[1..].join(":").trim().to_string());
     }
     h
 }
@@ -201,6 +205,7 @@ struct Opt {
     retry: usize,
     ffmpeg: String,
     replace_not_found: bool,
+    temp: bool,
     client: Option<Box<dyn HttpClient + Send + Sync>>,
     begin: Option<std::time::SystemTime>,
 }
@@ -780,9 +785,13 @@ mod reqwestclient {
                 .map_err(|f| format!("init fail {f}"))
         }
 
-        fn get(&self, url: &str, header: HashMap<String, String>) -> Result<Vec<u8>, (String, u16)> {
+        fn get(
+            &self,
+            url: &str,
+            header: HashMap<String, String>,
+        ) -> Result<Vec<u8>, (String, u16)> {
             let mut v = self.inner.get(url);
-            for (key,value) in header {
+            for (key, value) in header {
                 v = v.header(key, value);
             }
             match v.send().map_err(|e| e.to_string()) {
@@ -808,23 +817,30 @@ mod reqwestclient {
     }
 }
 
-pub(crate) struct Key{
-    uri:Option<String>,
-    key:m3u8_rs::Key
+pub(crate) struct Key {
+    uri: Option<String>,
+    key: m3u8_rs::Key,
 }
 
-impl Key{
-    pub(crate) fn new(key:Option<m3u8_rs::Key>,m3u8_url:&str)->Option<Self>{
-
-        key.map(|key|Self{
-            uri: key.uri.as_ref().and_then(|f|url::Url::parse(m3u8_url).and_then(|v|v.join(f.as_str())).ok()).map(|f|f.as_str().to_string()),
-            key
+impl Key {
+    pub(crate) fn new(key: Option<m3u8_rs::Key>, m3u8_url: &str) -> Option<Self> {
+        key.map(|key| Self {
+            uri: key
+                .uri
+                .as_ref()
+                .and_then(|f| {
+                    url::Url::parse(m3u8_url)
+                        .and_then(|v| v.join(f.as_str()))
+                        .ok()
+                })
+                .map(|f| f.as_str().to_string()),
+            key,
         })
     }
 }
 
-impl Deref for Key{
-    type Target=m3u8_rs::Key;
+impl Deref for Key {
+    type Target = m3u8_rs::Key;
 
     fn deref(&self) -> &Self::Target {
         &self.key
@@ -1168,7 +1184,7 @@ impl Opt {
             client: Some(Box::new(ureqclient::UReqClient::init(cli)?)),
             #[cfg(feature = "west")]
             client: Some(Box::new(reqwestclient::ReqWestClient::init(cli)?)),
-
+            temp: cli.temp,
             begin: Some(SystemTime::now()),
         })
     }
@@ -1236,7 +1252,7 @@ impl Opt {
                                 )
                             })
                             .filter(|f| f.1.is_ok())
-                            .map(|f| ( Key::new(f.0, url) , f.1.unwrap().to_string()))
+                            .map(|f| (Key::new(f.0, url), f.1.unwrap().to_string()))
                             .collect::<Vec<(Option<Key>, String)>>())
                     }
                     Err(e) => Err(e.to_string()),
@@ -1449,7 +1465,7 @@ impl Opt {
             // 文件协议
             return std::fs::read(url.replace("file://", "")).map_err(|e| (e.to_string(), 500));
         }
-        log::debug!("headers={:?}",header);
+        log::debug!("headers={:?}", header);
         match &self.client {
             Some(c) => c.get(url, header),
             None => unreachable!(),
@@ -1586,9 +1602,46 @@ impl Opt {
         }
 
         log::info!("start ffmpeg, the out file = {out}");
-        let c = std::process::Command::new(self.ffmpeg.as_str())
-            .arg("-i")
-            .arg(format!("concat:{}", files.join("|").as_str()).as_str())
+        let mut c = std::process::Command::new(self.ffmpeg.as_str());
+        if self.temp {
+            let temp = format!(
+                "{}/file.txt",
+                std::path::Path::new(files[0].as_str())
+                    .parent()
+                    .unwrap()
+                    .display()
+            );
+            // 使用临时文件
+            log::debug!("use temp file to save file list, out path = {}", temp);
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .read(true)
+                .truncate(true)
+                .open(&temp)
+                .and_then(|mut f| {
+                    f.write_all(
+                        files
+                            .iter()
+                            .flat_map(|f| std::path::Path::new(f).canonicalize())
+                            .map(|f| format!("file '{}'", f.display()))
+                            .collect::<Vec<String>>()
+                            .join("\n")
+                            .as_bytes(),
+                    )
+                })
+                .map_err(|e| format!("write temp file fail,reason: {}", e))?;
+            c.arg("-f")
+                .arg("concat")
+                .arg("-safe")
+                .arg("0")
+                .arg("-i")
+                .arg(temp);
+        } else {
+            c.arg("-i")
+                .arg(format!("concat:{}", files.join("|").as_str()));
+        };
+        let c = c
             .arg("-y")
             .arg("-c")
             .arg("copy")
@@ -1616,7 +1669,7 @@ impl Opt {
         if self.clear {
             let dir = Path::system(files[0].as_str()).pop();
             if let Err(e) = std::fs::remove_dir_all(dir.to_string()) {
-                log::warn!("删除ts文件失败 ={} {e}", dir.to_string());
+                log::warn!("删除文件失败 ={} {e}", dir.to_string());
             };
         }
 
@@ -1644,7 +1697,7 @@ impl Path {
         // for ele in v {
         //     paths.push(ele.to_string());
         // }
-        
+
         Self {
             paths: Vec::new(),
             sep: sep.to_string(),
@@ -1680,7 +1733,10 @@ impl Path {
         // if self.is_absolute {
         //     format!("/{}",self.paths.join(&self.sep))
         // }else{
-        self.paths.join(&self.sep).replace(format!("{}{}",self.sep,self.sep).as_str(),format!("{}",self.sep).as_str())
+        self.paths.join(&self.sep).replace(
+            format!("{}{}", self.sep, self.sep).as_str(),
+            format!("{}", self.sep).as_str(),
+        )
         // }
     }
     pub fn pop(&self) -> Self {
