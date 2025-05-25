@@ -9,12 +9,12 @@ on:
       - '.dockerignore'
   workflow_dispatch:
 env:
-  RUST_VERSION: 1.83.0
+  RUST_VERSION: 1.87.0
 jobs:
   linux: 
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-24.04
     container:
-      image: ghcr.io/inkroomtemp/rust_musl_build:1.83.0
+      image: ghcr.io/inkroomtemp/rust_musl_build:1.87.0
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -64,7 +64,7 @@ jobs:
           name: app-mac
           path: target/release/m3u8-dl-mac
   release:
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-24.04
     needs: ["mac","linux","windows"]
     permissions:
         contents: write
