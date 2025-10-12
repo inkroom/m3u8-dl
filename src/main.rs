@@ -109,7 +109,13 @@ impl Cli {
     pub(crate) fn get_m3u8(&self) -> Result<Vec<Item>, String> {
         let header = parse_header(self.header.clone());
         if let Some(json) = &self.json {
-            json::read_json(json.as_str())
+            match json::read_json(json.as_str()) {
+                Ok(mut t) => {
+                    t.iter_mut().for_each(|f| f.set_header(header.clone()));
+                    Ok(t)
+                }
+                Err(e) => Err(e),
+            }
         } else if let Some(f) = &self.json_file {
             let v = std::fs::read(f.as_str())
                 .map_err(|e| format!("read json_file fail, reason:{}", e))
