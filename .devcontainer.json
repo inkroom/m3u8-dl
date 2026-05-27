@@ -1,0 +1,20 @@
+{
+	"name": "m3u8-dl",
+	"build": {
+		"dockerfile": "Dockerfile.dev"
+	},
+	"customizations": {
+		"vscode": {
+			"extensions": [
+				"rust-lang.rust-analyzer",
+				"vadimcn.vscode-lldb",
+				"mikeburgh.xml-format",
+				"Natizyskunk.sftp",
+				"swellaby.vscode-rust-test-adapter"
+			]
+		}
+	},
+	"onCreateCommand":
+		"git config user.name $(git --no-pager log --pretty=\"%an\" | head -n 1) && git config user.email $(git --no-pager log --pretty=\"%ce\" | head -n 1)"
+	
+}
