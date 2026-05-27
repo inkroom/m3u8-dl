@@ -58,8 +58,8 @@ pub struct Cli {
         long_help = "如无该参数，将会尝试使用环境中的代理配置"
     )]
     no_proxy: bool,
-    #[arg(long, help = "ffmpeg可执行文件位置", default_value = "ffmpeg")]
-    ffmpeg: String,
+    #[arg(long, help = "ffmpeg可执行文件位置")]
+    ffmpeg: Option<String>,
     #[arg(
         long,
         help = "处理404",
@@ -209,7 +209,7 @@ struct Opt {
     clear: bool,
     skip: usize,
     retry: usize,
-    ffmpeg: String,
+    ffmpeg: Option<String>,
     replace_not_found: bool,
     temp: bool,
     client: Option<Box<dyn HttpClient + Send + Sync>>,
@@ -935,7 +935,9 @@ fn start_daemon(opt: Opt) {
 }
 fn main() {
     let cli = Cli::parse();
-
+    if cfg!(not(feature = "ffmpeg")) && cli.ffmpeg.is_none() {
+        panic!("Need ffmpeg use --ffmpeg");
+    }
     let opt = match Opt::new(&cli) {
         Ok(v) => v,
         Err(e) => {
@@ -1608,75 +1610,88 @@ impl Opt {
         }
 
         log::info!("start ffmpeg, the out file = {out}");
-        let mut c = std::process::Command::new(self.ffmpeg.as_str());
-        if self.temp {
-            let temp = format!(
-                "{}/file.txt",
-                std::path::Path::new(files[0].as_str())
-                    .parent()
-                    .unwrap()
-                    .display()
-            );
-            // 使用临时文件
-            log::debug!("use temp file to save file list, out path = {}", temp);
-            std::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .read(true)
-                .truncate(true)
-                .open(&temp)
-                .and_then(|mut f| {
-                    f.write_all(
-                        files
-                            .iter()
-                            .flat_map(|f| std::path::Path::new(f).canonicalize())
-                            .map(|f| format!("file '{}'", f.display()))
-                            .collect::<Vec<String>>()
-                            .join("\n")
-                            .as_bytes(),
-                    )
-                })
-                .map_err(|e| format!("write temp file fail,reason: {}", e))?;
-            c.arg("-f")
-                .arg("concat")
-                .arg("-safe")
-                .arg("0")
-                .arg("-i")
-                .arg(temp);
-        } else {
-            c.arg("-i")
-                .arg(format!("concat:{}", files.join("|").as_str()));
-        };
-        let c = c
-            .arg("-y")
-            .arg("-c")
-            .arg("copy")
-            .arg(out)
-            .stderr(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .spawn()
-            .map_err(|e| format!("exec ffmpeg e ={}", e))?;
-        let mut s = c
-            .wait_with_output()
-            .map_err(|e| format!("ffmpeg exec error = {e}"))?;
 
-        let mut out = Vec::new();
-        out.append(&mut s.stdout);
-        out.append(&mut s.stderr);
-
-        if !s.status.success() {
-            return Err(format!(
-                "ffmpge return e = {}, {}",
-                s.status.code().unwrap_or(-1),
-                String::from_utf8(out).map_err(|e| format!("get out e ={e}"))?
-            ));
-        }
-
-        if self.clear {
-            let dir = Path::system(files[0].as_str()).pop();
-            if let Err(e) = std::fs::remove_dir_all(dir.to_string()) {
-                log::warn!("删除文件失败 ={} {e}", dir.to_string());
+        if let Some(ffmpeg) = &self.ffmpeg {
+            let mut c = std::process::Command::new(ffmpeg.as_str());
+            if self.temp {
+                let temp = format!(
+                    "{}/file.txt",
+                    std::path::Path::new(files[0].as_str())
+                        .parent()
+                        .unwrap()
+                        .display()
+                );
+                // 使用临时文件
+                log::debug!("use temp file to save file list, out path = {}", temp);
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .read(true)
+                    .truncate(true)
+                    .open(&temp)
+                    .and_then(|mut f| {
+                        f.write_all(
+                            files
+                                .iter()
+                                .flat_map(|f| std::path::Path::new(f).canonicalize())
+                                .map(|f| format!("file '{}'", f.display()))
+                                .collect::<Vec<String>>()
+                                .join("\n")
+                                .as_bytes(),
+                        )
+                    })
+                    .map_err(|e| format!("write temp file fail,reason: {}", e))?;
+                c.arg("-f")
+                    .arg("concat")
+                    .arg("-safe")
+                    .arg("0")
+                    .arg("-i")
+                    .arg(temp);
+            } else {
+                c.arg("-i")
+                    .arg(format!("concat:{}", files.join("|").as_str()));
             };
+            let c = c
+                .arg("-y")
+                .arg("-c")
+                .arg("copy")
+                .arg(out)
+                .stderr(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .map_err(|e| format!("exec ffmpeg e ={}", e))?;
+            let mut s = c
+                .wait_with_output()
+                .map_err(|e| format!("ffmpeg exec error = {e}"))?;
+
+            let mut out = Vec::new();
+            out.append(&mut s.stdout);
+            out.append(&mut s.stderr);
+
+            if !s.status.success() {
+                return Err(format!(
+                    "ffmpge return e = {}, {}",
+                    s.status.code().unwrap_or(-1),
+                    String::from_utf8(out).map_err(|e| format!("get out e ={e}"))?
+                ));
+            }
+
+            if self.clear {
+                let dir = Path::system(files[0].as_str()).pop();
+                if let Err(e) = std::fs::remove_dir_all(dir.to_string()) {
+                    log::warn!("删除文件失败 ={} {e}", dir.to_string());
+                };
+            }
+        } else {
+            #[cfg(not(feature = "ffmpeg"))]
+            {
+                panic!("Need ffmpeg use -ffmpeg")
+            }
+            #[cfg(feature = "ffmpeg")]
+            if let Err(merge_ts_to_mp4) = ff::merge_ts_to_mp4(&files, &out) {
+                let _ = std::fs::remove_file(&out);
+                return Err(merge_ts_to_mp4);
+            }
         }
 
         Ok(())
@@ -1751,6 +1766,172 @@ impl Path {
         s
     }
 }
+
+#[cfg(feature = "ffmpeg")]
+mod ff {
+    use ffmpeg_next::{self as ffmpeg, codec, encoder};
+    use std::path::Path;
+
+    /// 使用ffmpeg-next库合并多个ts文件成mp4
+    ///
+    /// 该函数使用concat demuxer方式合并ts文件，无需重新编码，性能更优。
+    /// 它直接复制视频和音频流到输出文件，保持原始质量。
+    ///
+    /// # 参数
+    /// - `ts_files`: ts文件路径列表，按顺序合并
+    /// - `output_path`: 输出的mp4文件路径
+    ///
+    /// # 返回值
+    /// 返回Result，成功返回Ok(())，失败返回错误信息
+    ///
+    /// # 示例
+    /// ```no_run
+    /// use m3u8_dl::merge::merge_ts_to_mp4;
+    /// let ts_files = vec![
+    ///     "/path/to/1.ts".to_string(),
+    ///     "/path/to/2.ts".to_string(),
+    ///     "/path/to/3.ts".to_string(),
+    /// ];
+    /// merge_ts_to_mp4(&ts_files, "/path/to/output.mp4")?;
+    /// # Ok::<(), String>(())
+    /// ```
+    pub fn merge_ts_to_mp4(ts_files: &[String], output_path: &str) -> Result<(), String> {
+        if ts_files.is_empty() {
+            return Err("ts文件列表不能为空".to_string());
+        }
+
+        if output_path.is_empty() {
+            return Err("输出文件路径不能为空".to_string());
+        }
+
+        // 验证所有ts文件存在
+        for (idx, ts_file) in ts_files.iter().enumerate() {
+            if !Path::new(ts_file).exists() {
+                return Err(format!("第{}个ts文件不存在: {}", idx + 1, ts_file));
+            }
+        }
+
+        // 初始化ffmpeg库
+        ffmpeg::init().map_err(|e| format!("ffmpeg初始化失败: {}", e))?;
+
+        // 使用concat demuxer方式合并
+        merge_with_concat(ts_files, output_path)
+    }
+
+    /// 使用concat demuxer合并视频文件
+    ///
+    /// concat demuxer 不需要重新编码，直接复制流数据到输出文件。
+    /// 这是合并ts文件的推荐方式，性能最优。
+    fn merge_with_concat(ts_files: &[String], output_path: &str) -> Result<(), String> {
+        // 创建concat输入字符串：concat:file1.ts|file2.ts|file3.ts
+        let concat_input = format!("concat:{}", ts_files.join("|"));
+
+        log::info!("使用concat demuxer合并文件: {}", concat_input);
+
+        // 打开concat输入
+        let mut input = ffmpeg::format::input(&concat_input)
+            .map_err(|e| format!("打开concat输入失败: {}", e))?;
+
+        // 创建输出上下文
+        let mut output =
+            ffmpeg::format::output(output_path).map_err(|e| format!("创建输出文件失败: {}", e))?;
+
+        // 查找视频流
+        let video_stream_idx = input
+            .streams()
+            .best(ffmpeg::media::Type::Video)
+            .map(|s| s.index())
+            .ok_or("找不到视频流".to_string())?;
+
+        log::info!("找到视频流: 索引={}", video_stream_idx);
+
+        // 查找音频流（如果存在）
+        let audio_stream_idx = input
+            .streams()
+            .best(ffmpeg::media::Type::Audio)
+            .map(|s| s.index());
+
+        if let Some(idx) = audio_stream_idx {
+            log::info!("找到音频流: 索引={}", idx);
+        }
+
+        // 复制视频流
+        copy_stream(&mut input, &mut output, video_stream_idx)?;
+
+        // 复制音频流（如果存在）
+        if let Some(audio_idx) = audio_stream_idx {
+            copy_stream(&mut input, &mut output, audio_idx)?;
+        }
+
+        // 写入文件头
+        output
+            .write_header()
+            .map_err(|e| format!("写入文件头失败: {}", e))?;
+
+        log::info!("开始复制数据包...");
+
+        // 复制所有数据包
+        let mut packet_count = 0;
+        for (_stream, packet) in input.packets() {
+            if packet.stream() == video_stream_idx {
+                packet
+                    .write_interleaved(&mut output)
+                    // output.write(&packet)
+                    .map_err(|e| format!("写入视频数据包失败: {}", e))?;
+                packet_count += 1;
+            } else if audio_stream_idx.map_or(false, |idx| packet.stream() == idx) {
+                packet
+                    .write_interleaved(&mut output)
+                    .map_err(|e| format!("写入音频数据包失败: {}", e))?;
+                packet_count += 1;
+            }
+        }
+
+        log::info!("已复制 {} 个数据包", packet_count);
+
+        // 写入文件尾
+        output
+            .write_trailer()
+            .map_err(|e| format!("写入文件尾失败: {}", e))?;
+
+        log::info!("合并完成，输出文件: {}", output_path);
+
+        Ok(())
+    }
+
+    /// 辅助函数：从输入流复制流参数到输出
+    ///
+    /// 该函数会自动检测输入流的编码方式，创建匹配的输出流，
+    /// 并复制所有相关的参数。
+    fn copy_stream(
+        input: &mut ffmpeg::format::context::Input,
+        output: &mut ffmpeg::format::context::Output,
+        stream_idx: usize,
+    ) -> Result<(), String> {
+        let input_stream = input
+            .stream(stream_idx)
+            .ok_or(format!("找不到流 {}", stream_idx))?;
+
+        let codec_id = input_stream.parameters().id();
+        log::debug!("流 {} 编码格式: {:?}", stream_idx, codec_id);
+
+        let encoder =
+            ffmpeg::encoder::find(codec_id).ok_or(format!("找不到编码器: {:?}", codec_id))?;
+
+        let mut out_stream = output
+            .add_stream(encoder::find(codec::Id::None))
+            .map_err(|e| format!("添加输出流失败: {}", e))?;
+
+        out_stream.set_parameters(input_stream.parameters());
+        unsafe {
+            (*out_stream.parameters().as_mut_ptr()).codec_tag = 0;
+        }
+        log::debug!("流参数复制完成");
+
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::AtomicU32;
