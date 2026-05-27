@@ -9,31 +9,50 @@ on:
       - '.dockerignore'
   workflow_dispatch:
 env:
-  RUST_VERSION: 1.87.0
+  RUST_VERSION: 1.95.0
 jobs:
   linux: 
     runs-on: ubuntu-24.04
     container:
-      image: ghcr.io/inkroomtemp/rust_musl_build:1.87.0
+      image: ghcr.io/inkroomtemp/rust_musl_build:1.95.0
+    
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
+      - name: Install dependencies
+        run: |
+          apt update
+          apt install -y nasm curl pkg-config ca-certificates ffmpeg bsdmainutils unzip libavcodec-dev libavformat-dev libavutil-dev libavfilter-dev libavdevice-dev
+      - name: Set up Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          override: true
       - name: Build
         run: |
-          env
-          rustup show
-          mkdir out
-          cargo build --release --target=x86_64-unknown-linux-musl
+          cargo build --release --target=$(arch)-unknown-linux-musl --features build
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: app-linux
           path: target/x86_64-unknown-linux-musl/release/m3u8-dl
   windows:
-    runs-on: windows-2022
+    runs-on: windows-latest
+    env:
+      FFMPEG_DOWNLOAD_URL: https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-full-shared.7z
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
+      - name: Install dependencies
+        run: |
+          $VCINSTALLDIR = $(& "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath)
+          Add-Content $env:GITHUB_ENV "LIBCLANG_PATH=${VCINSTALLDIR}\VC\Tools\LLVM\x64\bin`n"
+          Invoke-WebRequest "${env:FFMPEG_DOWNLOAD_URL}" -OutFile ffmpeg-release-full-shared.7z
+          7z x ffmpeg-release-full-shared.7z
+          mkdir ffmpeg
+          mv ffmpeg-*/* ffmpeg/
+          Add-Content $env:GITHUB_ENV "FFMPEG_DIR=${pwd}\ffmpeg`n"
+          Add-Content $env:GITHUB_PATH "${pwd}\ffmpeg\bin`n"
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: ${{ env.RUST_VERSION }}
@@ -41,25 +60,28 @@ jobs:
         env:
           RUSTFLAGS: "-C target-feature=+crt-static"
         run: |
-          cargo build --release
+          cargo build --release --features ffmpeg -vv
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: app-windows
           path: target/release/m3u8-dl.exe
   mac: 
-    runs-on: macos-13
+    runs-on: macos-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
+      - name: Install dependencies
+        run: |
+          brew install ffmpeg pkg-config
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: ${{ env.RUST_VERSION }}
       - name: Build
         run: |
-          cargo build --release && mv target/release/m3u8-dl target/release/m3u8-dl-mac
+          cargo build --release --features build && mv target/release/m3u8-dl target/release/m3u8-dl-mac
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: app-mac
           path: target/release/m3u8-dl-mac
@@ -71,12 +93,12 @@ jobs:
         packages: write
     steps:
         - name: Checkout repository
-          uses: actions/checkout@v4
+          uses: actions/checkout@v6
           with:
             fetch-tags: true
             fetch-depth: 0
         - name: Download artifacts
-          uses: actions/download-artifact@v4
+          uses: actions/download-artifact@v8
           with:
             merge-multiple: true
             pattern: app-*
