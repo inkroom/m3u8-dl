@@ -1,41 +1,104 @@
-![act-logo](https://raw.githubusercontent.com/wiki/nektos/act/img/logo-150.png)
+# m3u8-dl
 
-# Overview [![push](https://github.com/nektos/act/workflows/push/badge.svg?branch=master&event=push)](https://github.com/nektos/act/actions) [![Go Report Card](https://goreportcard.com/badge/github.com/nektos/act)](https://goreportcard.com/report/github.com/nektos/act) [![awesome-runners](https://img.shields.io/badge/listed%20on-awesome--runners-blue.svg)](https://github.com/jonico/awesome-runners)
+下载m3u8视频文件并合并(~~要求装有ffmpeg~~)
 
-> "Think globally, `act` locally"
 
-Run your [GitHub Actions](https://developer.github.com/actions/) locally! Why would you want to do this? Two reasons:
+## usage
 
-- **Fast Feedback** - Rather than having to commit/push every time you want to test out the changes you are making to your `.github/workflows/` files (or for any changes to embedded GitHub actions), you can use `act` to run the actions locally. The [environment variables](https://help.github.com/en/actions/configuring-and-managing-workflows/using-environment-variables#default-environment-variables) and [filesystem](https://help.github.com/en/actions/reference/virtual-environments-for-github-hosted-runners#filesystems-on-github-hosted-runners) are all configured to match what GitHub provides.
-- **Local Task Runner** - I love [make](<https://en.wikipedia.org/wiki/Make_(software)>). However, I also hate repeating myself. With `act`, you can use the GitHub Actions defined in your `.github/workflows/` to replace your `Makefile`!
+```
+Usage: m3u8-dl [OPTIONS]
 
-> [!TIP]
-> **Now Manage and Run Act Directly From VS Code!**<br/>
-> Check out the [GitHub Local Actions](https://sanjulaganepola.github.io/github-local-actions-docs/) Visual Studio Code extension which allows you to leverage the power of `act` to run and test workflows locally without leaving your editor.
+Options:
+  -u, --url <URL>
+          m3u8地址
 
-# How Does It Work?
+  -d, --dir <DIR>
+          输出文件夹
 
-When you run `act` it reads in your GitHub Actions from `.github/workflows/` and determines the set of actions that need to be run. It uses the Docker API to either pull or build the necessary images, as defined in your workflow files and finally determines the execution path based on the dependencies that were defined. Once it has the execution path, it then uses the Docker API to run containers for each action based on the images prepared earlier. The [environment variables](https://help.github.com/en/actions/configuring-and-managing-workflows/using-environment-variables#default-environment-variables) and [filesystem](https://docs.github.com/en/actions/using-github-hosted-runners/about-github-hosted-runners#file-systems) are all configured to match what GitHub provides.
+  -n, --name <NAME>
+          输出文件名，必须以mp4或者mkv结尾
 
-Let's see it in action with a [sample repo](https://github.com/cplee/github-actions-demo)!
+      --exclude <EXCLUDE>
+          排除部分ts文件；json key=[e]
 
-![Demo](https://raw.githubusercontent.com/wiki/nektos/act/quickstart/act-quickstart-2.gif)
+      --prefix <PREFIX>
+          使用file协议时用于指定ts文件前缀；json key=[p]
 
-# Act User Guide
+      --header <HEADER>
+          请求头，用法同curl
 
-Please look at the [act user guide](https://nektosact.com) for more documentation.
+  -j, --json <JSON>
+          读取json格式，例如[{"n":"1.mp4","u":"http://demo.com/1.m3u8","d":"/root"}]
 
-# Support
+      --json-file <JSON_FILE>
+          从文件读取json格式
 
-Need help? Ask in [discussions](https://github.com/nektos/act/discussions)!
+      --uid <UID>
+          使用指定uid运行程序(unavailable on windows)
 
-# Contributing
+  -t, --thread <THREAD>
+          线程数量
+          
+          [default: 4]
 
-Want to contribute to act? Awesome! Check out the [contributing guidelines](CONTRIBUTING.md) to get involved.
+      --daemon
+          后台运行
 
-## Manually building from source
+  -l, --log <LOG>
+          日志文件位置
 
-- Install Go tools 1.20+ - (<https://golang.org/doc/install>)
-- Clone this repo `git clone git@github.com:nektos/act.git`
-- Run unit tests with `make test`
-- Build and install: `make install`
+  -c, --clear
+          完成删除中间文件
+
+  -s, --skip <SKIP>
+          跳过ts文件开头字节数
+          
+          [default: 0]
+
+  -r, --retry <RETRY>
+          下载重试次数
+          
+          [default: 3]
+
+      --proxy <PROXY>
+          代理,如127.0.0.1:7382
+
+      --no-proxy
+          如无该参数，将会尝试使用环境中的代理配置
+
+      --ffmpeg <FFMPEG>
+          ffmpeg可执行文件位置
+          
+      --replace-not-found
+          当ts返回404时，使用最近的已下载的ts替换；如果启用多线程可能会导致替换失败或者源文件过于靠前
+
+      --temp
+          当文件数过多导致合并失败时，可以使用该参数借助临时文件合并视频
+
+  -v, --verbose
+          输出更多日志
+
+  -h, --help
+          Print help (see a summary with '-h')
+```
+
+一共三种使用方式，如果只需要下载单个视频，使用`-u`、`-d`、`-n`
+
+如果下载大量视频，使用 json格式，样例如下
+```json
+[{"n":"1.mp4","u":"http://demo.com/1.m3u8","d":"/root"}]
+```
+
+通过`--json`直接传入json字符串，或者使用`--json-file`指定json文件位置，在unix上也可使用管道传递，例如`cat 1.json | m3u8-dl`
+
+---
+
+当同时下载大量视频时，不能保证一个视频下载完成后才开始下载下一个视频，如果需要该效果，改为执行多条命令，或者`--thread 1`（可能会拖累下载效率）
+
+## 构建
+
+rust版本 1.95.0
+
+```shell
+cargo build
+```

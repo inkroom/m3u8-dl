@@ -42,21 +42,18 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
-      - name: Install dependencies
-        env:
-          FFMPEG_DOWNLOAD_URL: https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-full-shared.7z
+      - name: Cache FFmpeg
+        id: ffmpeg-cache
+        uses: actions/cache@v5
+        with:
+          # 你想要缓存的目录路径（支持绝对路径或相对路径）
+          path: |
+            C:/vcpkg/packages/ffmpeg_x64-windows-static/
+          key: ffmpeg
+      - name: Install FFmpeg
+        if: steps.ffmpeg-cache.outputs.cache-hit != 'true'
         run: |
-          $VCINSTALLDIR = $(& "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath)
-          Add-Content $env:GITHUB_ENV "LIBCLANG_PATH=${VCINSTALLDIR}\VC\Tools\LLVM\x64\bin`n"
-          Invoke-WebRequest "${env:FFMPEG_DOWNLOAD_URL}" -OutFile ffmpeg-release-full-shared.7z
-          7z x ffmpeg-release-full-shared.7z
-          mkdir ffmpeg
-          mv ffmpeg-*/* ffmpeg/
-          Add-Content $env:GITHUB_ENV "FFMPEG_DIR=${pwd}\ffmpeg`n"
-          Add-Content $env:GITHUB_PATH "${pwd}\ffmpeg\bin`n"
-      - name: Install dependencies
-        run: |
-          vcpkg install ffmpeg:x64-windows-static
+          vcpkg install ffmpeg[core,avcodec,avformat]:x64-windows-static
           ls C:/vcpkg/packages/ffmpeg_x64-windows-static/
           ls C:/vcpkg/packages/ffmpeg_x64-windows-static/lib
       - uses: dtolnay/rust-toolchain@stable
