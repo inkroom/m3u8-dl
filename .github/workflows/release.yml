@@ -22,60 +22,172 @@ jobs:
       - name: Install dependencies
         run: |
           apt update
-          apt install -y nasm curl pkg-config ca-certificates ffmpeg bsdmainutils unzip libavcodec-dev libavformat-dev libavutil-dev libavfilter-dev libavdevice-dev
+          apt install -y tree nasm curl pkg-config ca-certificates ffmpeg bsdmainutils unzip libavcodec-dev libavformat-dev libavutil-dev libavfilter-dev libavdevice-dev
+      - name: Cache FFmpeg
+        id: ffmpeg-cache-mini
+        uses: actions/cache@v5
+        with:
+          path: mini
+          key: ffmpeg-${{ runner.os }}-mini
+      - name: Cache FFmpeg
+        id: ffmpeg-cache-full
+        uses: actions/cache@v5
+        with:
+          path: full
+          key: ffmpeg-${{ runner.os }}-full
+      - name: Compile FFmpeg
+        if: steps.ffmpeg-cache-mini.outputs.cache-hit != 'true'
+        run: |
+          pwd
+          cur=$(pwd)
+          git clone https://github.com/ffmpeg/ffmpeg -b release/8.1 --depth=1 ffmpeg-mini
+          cd ffmpeg-mini
+          ./configure --prefix=$cur/mini --disable-everything --enable-cross-compile --arch=x86_64 --target-os=linux --cross-prefix=x86_64-unknown-linux-musl- --disable-debug --enable-stripping --enable-static --enable-pthreads --disable-autodetect --enable-avcodec --enable-avformat  --extra-cflags=-w --disable-filters --disable-ffprobe --disable-avdevice --disable-swscale --disable-avfilter --disable-swresample --enable-muxer=mp4,flv,mkv,mp3,hevc,h264,h263,h261 --enable-demuxer=aac,m4v,h261,h263,h264,hevc,hls,mp3,ac,flv --enable-encoder=aac,flac,flv,mpeg4 --enable-decoder=aac,mp3,h261,h263,h163i,h263p,h264,hevc,yuv4,rv40 --enable-protocol=data,concat,concatf,data,crypto,async,cache,file,subfile,tee
+          make && make install
+          ls -all $cur/mini/lib
+      - uses: actions/cache/save@v5
+        if: steps.ffmpeg-cache-mini.outputs.cache-hit != 'true'
+        with:
+          path: mini
+          key: ffmpeg-${{ runner.os }}-mini
+      - name: Compile FFmpeg Full
+        if: steps.ffmpeg-cache-full.outputs.cache-hit != 'true'
+        run: |
+          pwd
+          cur=$(pwd)
+          git clone https://github.com/ffmpeg/ffmpeg -b release/8.1 --depth=1 ffmpeg-full
+          cd ffmpeg-full
+          ./configure --prefix=$cur/full --enable-cross-compile --arch=x86_64 --target-os=linux --cross-prefix=x86_64-unknown-linux-musl- --disable-debug --enable-stripping --enable-static --disable-shared --enable-pthreads --enable-pic --disable-autodetect --disable-programs --disable-doc --disable-gpl --disable-version3 --disable-nonfree --enable-avcodec --disable-avdevice --disable-avfilter --enable-avformat --disable-swresample --disable-swscale --extra-cflags=-w
+          make && make install
+          ls -all $cur/full/lib
+      - uses: actions/cache/save@v5
+        if: steps.ffmpeg-cache-full.outputs.cache-hit != 'true'
+        with:
+          path: full
+          key: ffmpeg-${{ runner.os }}-full
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: ${{ env.RUST_VERSION }}
       - name: Build
         run: |
-          cargo build --release --target=$(arch)-unknown-linux-musl && mv target/x86_64-unknown-linux-musl/release/m3u8-dl target/x86_64-unknown-linux-musl/release/m3u8-dl-wioutffmpeg
-          cargo build --release --target=$(arch)-unknown-linux-musl --features build
-          rm -rf target/x86_64-unknown-linux-musl/release/m3u8-dl.d
+          pwd
+          ls -all mini/lib
+          ls -all full/lib
+          mkdir app
+          echo "::group::无FFMPEG"
+          cargo build --release --target=$(arch)-unknown-linux-musl && mv target/x86_64-unknown-linux-musl/release/m3u8-dl app/m3u8-dl_linux-wioutffmpeg
+          echo "::endgroup::"
+
+          echo "::group::full"
+          cargo clean
+          FFMPEG_DIR="$(pwd)/full" cargo build --release --target=$(arch)-unknown-linux-musl --features static && mv target/x86_64-unknown-linux-musl/release/m3u8-dl app/m3u8-dl_linux-full
+          echo "::endgroup::"
+
+          echo "::group::mini"
+          cargo clean
+          FFMPEG_DIR="$(pwd)/mini" cargo build --release --target=$(arch)-unknown-linux-musl --features static && mv target/x86_64-unknown-linux-musl/release/m3u8-dl app/m3u8-dl_linux
+          echo "::endgroup::"
+          tree ${{ github.workspace }}
       - name: Upload artifacts
         uses: actions/upload-artifact@v7
         with:
           name: app-linux
-          path: target/x86_64-unknown-linux-musl/release/m3u8-dl*
+          path: app/m3u8-dl_*
   windows:
     runs-on: windows-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
       - name: Cache FFmpeg
-        id: ffmpeg-cache
+        id: ffmpeg-cache-mini
         uses: actions/cache@v5
         with:
           # 你想要缓存的目录路径（支持绝对路径或相对路径）
           path: |
-            C:/vcpkg/packages/ffmpeg_x64-windows-static/
-          key: ffmpeg
-      - name: Install FFmpeg
-        if: steps.ffmpeg-cache.outputs.cache-hit != 'true'
+            ${{ github.workspace }}/mini
+          key: ffmpeg-${{ runner.os }}-mini
+      - name: Cache FFmpeg
+        id: ffmpeg-cache-full
+        uses: actions/cache@v5
+        with:
+          # 你想要缓存的目录路径（支持绝对路径或相对路径）
+          path: |
+            ${{ github.workspace }}/full
+          key: ffmpeg-${{ runner.os }}-full
+      - name: Install FFmpeg Full
+        if: steps.ffmpeg-cache-full.outputs.cache-hit != 'true'
         run: |
           vcpkg install ffmpeg[core,avcodec,avformat]:x64-windows-static
+          $srcPath = "C:/vcpkg/packages/ffmpeg_x64-windows-static"
+          $destPath = "${{ github.workspace }}/full"
+          Copy-Item -Path $srcPath -Destination $destPath -Recurse -Force
+          ls ${{ github.workspace }}/full/lib
+          vcpkg remove ffmpeg --recurse
+      - name: Install FFmpeg
+        if: steps.ffmpeg-cache-mini.outputs.cache-hit != 'true'
+        run: |
+          git clone https://github.com/microsoft/vcpkg/ --depth=1 -b 2026.06.01
+          New-Item -ItemType Directory -Force -Path "custom-ports/ffmpeg"
+          Copy-Item -Path "./vcpkg/ports/ffmpeg/*" -Destination "custom-ports/ffmpeg" -Recurse -Force
+          $portfile = "custom-ports/ffmpeg/portfile.cmake"
+          Get-Content $portfile
+          $content = Get-Content $portfile
+        
+          # 寻找 vcpkg_configure_make 内部的 OPTIONS 数组结束前的括号，注入参数
+          # 这里我们在 OPTIONS 的常见结构中寻找切入点，或者直接在追加到数组变量中
+          # 一种稳妥的做法是定位到 vcpkg_configure_make( 并在其 OPTIONS 后面插入
+          # 本处使用直接文本替换法，在 OPTIONS 关键字后插入自定义参数
+          $target = 'message(STATUS "Building Options: ${OPTIONS}")'
+          $custom_options = "set(OPTIONS `"--toolchain=msvc --disable-everything  --disable-doc --disable-alsa --disable-amf --disable-libaom --disable-libass --disable-avisynth --disable-bzlib --disable-libdav1d --disable-libfdk-aac --disable-libfontconfig --disable-libharfbuzz --disable-libfreetype --disable-libfribidi --disable-iconv --disable-libilbc --disable-lzma --disable-libmp3lame --disable-libmodplug --disable-ffmpeg --disable-ffplay --disable-ffprobe --enable-avcodec --disable-cuda --disable-nvenc --disable-nvdec  --disable-cuvid --disable-ffnvcodec --disable-opencl --disable-opengl --disable-libopenh264 --disable-libopenjpeg --disable-libopenmpt --disable-openssl --enable-schannel --disable-libopus --disable-sdl2 --disable-libsnappy --disable-libsoxr --disable-libspeex --disable-libssh --disable-libtensorflow --disable-libtesseract --disable-libtheora --disable-libvorbis --disable-libvpx --disable-vulkan --disable-libwebp --disable-libx264 --disable-libx265 --disable-libxml2 --disable-zlib --disable-libsrt --disable-libvpl --disable-vaapi --disable-libzmq --disable-librubberband --disable-avdevice --disable-swscale --disable-avfilter --disable-swresample --disable-doc --enable-runtime-cpudetect --target-os=win32 --enable-w32threads --cc=`${CC_filename} --cxx=`${CXX_filename} --windres=`${RC_filename} --ld=`${LD_filename} --ar='ar-lib `${AR_filename}' --ranlib=: --enable-avcodec --enable-avformat  --enable-cross-compile --enable-muxer=mp4,flv,mkv,mp3,hevc,h264,h263,h261 --enable-demuxer=aac,m4v,h261,h263,h264,hevc,hls,mp3,ac,flv --enable-encoder=aac,flac,flv,mpeg4 --enable-decoder=aac,mp3,h261,h263,h163i,h263p,h264,hevc,yuv4,rv40 --enable-protocol=data,concat,concatf,data,crypto,async,cache,file,subfile,tee --extra-cflags=-DHAVE_UNISTD_H=0 --pkg-config=\`"`${PKGCONFIG}\`" --pkg-config-flags=--static`")"
+          # 在目标字符串前面拼接自定义参数
+          $replacement = $custom_options + "`n    " + $target
+          
+          # 执行替换
+          $new_content = $content.Replace($target, $replacement)
+          
+          Set-Content -Path $portfile -Value $new_content
+          
+          # 打印修改后的文件片段用于验证 CI 日志
+          Write-Host "--- Modified portfile.cmake (Preview) ---"
+          Get-Content $portfile
+
+
+          vcpkg install ffmpeg[core,avcodec,avformat]:x64-windows-static --overlay-ports=custom-ports --recurse
           ls C:/vcpkg/packages/ffmpeg_x64-windows-static/
           ls C:/vcpkg/packages/ffmpeg_x64-windows-static/lib
+          $srcPath = "C:/vcpkg/packages/ffmpeg_x64-windows-static"
+          $destPath = "${{ github.workspace }}/mini"
+          Copy-Item -Path $srcPath -Destination $destPath -Recurse -Force
+          ls ${{ github.workspace }}/mini/lib
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: ${{ env.RUST_VERSION }}
       - name: Build
         env:
           RUSTFLAGS: "-C target-feature=+crt-static"
-          FFMPEG_DIR: "C:/vcpkg/packages/ffmpeg_x64-windows-static"
         run: |
+          New-Item -ItemType Directory -Force -Path "app"
+          echo "::group::full"
+          ls ${{ github.workspace }}/full/lib
+          $env:FFMPEG_DIR = "${{ github.workspace }}/full"
           cargo build --release --features static -vv
-      - name: Check linked DLLs
-        shell: pwsh
-        run: |
-          Select-String -Path "target\release\m3u8-dl.exe" -Pattern '\.dll\b' -AllMatches | 
-          ForEach-Object { $_.Matches.Value } | 
-          Sort-Object -Unique
+          Copy-Item -Path target/release/m3u8-dl.exe -Destination app/m3u8-dl_windows-full.exe -Recurse -Force
+          echo "::endgroup::"
+
+          echo "::group::mini"
+          cargo clean
+          $env:FFMPEG_DIR = "${{ github.workspace }}/mini"
+          ls ${{ github.workspace }}/mini/lib
+          cargo build --release --features static -vv
+          Copy-Item -Path target/release/m3u8-dl.exe -Destination app/m3u8-dl_windows.exe -Recurse -Force
+          echo "::endgroup::"
       - name: Upload artifacts
         uses: actions/upload-artifact@v7
         with:
           name: app-windows
-          path: target/release/m3u8-dl.exe
+          path: |
+            app/*.exe
   windows-check:
     needs: ["windows"]
     runs-on: windows-latest
@@ -90,7 +202,7 @@ jobs:
           path: app/
       - name: Check
         run: |
-          ./app/m3u8-dl.exe --help
+          ./app/m3u8-dl_windows.exe --help
   mac: 
     runs-on: macos-latest
     steps:
@@ -99,18 +211,60 @@ jobs:
       - name: Install dependencies
         run: |
           brew install ffmpeg pkg-config
+      - name: Cache FFmpeg
+        id: ffmpeg-cache-mini
+        uses: actions/cache@v5
+        with:
+          path: |
+            ${{ github.workspace }}/mini
+          key: ffmpeg-${{ runner.os }}-mini
+      - name: Cache FFmpeg
+        id: ffmpeg-cache-full
+        uses: actions/cache@v5
+        with:
+          path: |
+            ${{ github.workspace }}/full
+          key: ffmpeg-${{ runner.os }}-full
+      - name: Compile FFmpeg
+        if: steps.ffmpeg-cache-full.outputs.cache-hit != 'true'
+        run: |
+          git clone https://github.com/ffmpeg/ffmpeg -b release/8.1 --depth=1 ffmpeg-mini
+          cd ffmpeg-mini
+          ./configure --prefix=${{ github.workspace }}/mini --disable-everything --extra-cflags='-march=native -mtune=native' --enable-debug --disable-stripping --enable-static --disable-shared --enable-pthreads --enable-pic --disable-autodetect --disable-programs --disable-doc --disable-gpl --disable-version3 --disable-nonfree --enable-avcodec --disable-avdevice --disable-avfilter --enable-avformat --disable-swresample --disable-swscale --extra-cflags=-w  --enable-muxer=mp4,flv,mkv,mp3,hevc,h264,h263,h261 --enable-demuxer=aac,m4v,h261,h263,h264,hevc,hls,mp3,ac,flv --enable-encoder=aac,flac,flv,mpeg4 --enable-decoder=aac,mp3,h261,h263,h163i,h263p,h264,hevc,yuv4,rv40 --enable-protocol=data,concat,concatf,data,crypto,async,cache,file,subfile,tee
+          make && make install
+          ls -all ${{ github.workspace }}/mini/lib
+      - name: Compile FFmpeg Full
+        if: steps.ffmpeg-cache-full.outputs.cache-hit != 'true'
+        run: |
+          git clone https://github.com/ffmpeg/ffmpeg -b release/8.1 --depth=1 ffmpeg-full
+          cd ffmpeg-full
+          ./configure --prefix=${{ github.workspace }}/full --extra-cflags='-march=native -mtune=native' --enable-debug --disable-stripping --enable-static --disable-shared --enable-pthreads --enable-pic --disable-autodetect --disable-programs --disable-doc --disable-gpl --disable-version3 --disable-nonfree --enable-avcodec --disable-avdevice --disable-avfilter --enable-avformat --disable-swresample --disable-swscale --extra-cflags=-w
+          make && make install
+          ls -all ${{ github.workspace }}/full/lib
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: ${{ env.RUST_VERSION }}
       - name: Build
         run: |
-          cargo build --release --features build && mv target/release/m3u8-dl target/release/m3u8-dl-mac
-          cargo build --release --features build && mv target/release/m3u8-dl target/release/m3u8-dl-mac-withoutffmpeg
+          mkdir app
+          echo "::group::无FFMPEG"
+          FFMPEG_DIR="${{ github.workspace }}/mini" cargo build --release && mv target/release/m3u8-dl app/m3u8-dl_mac-withoutffmpeg
+          echo "::endgroup::"
+
+          echo "::group::full"
+          cargo clean
+          FFMPEG_DIR="${{ github.workspace }}/full" cargo build --release --features static -vv && mv target/release/m3u8-dl app/m3u8-dl_mac-full
+          echo "::endgroup::"
+          
+          echo "::group::mini"
+          cargo clean
+          FFMPEG_DIR="${{ github.workspace }}/mini" cargo build --release --features static -vv && mv target/release/m3u8-dl app/m3u8-dl_mac
+          echo "::endgroup::"
       - name: Upload artifacts
         uses: actions/upload-artifact@v7
         with:
           name: app-mac
-          path: target/release/m3u8-dl-mac*
+          path: app/*
   release:
     runs-on: ubuntu-24.04
     needs: ["mac","linux","windows-check"]

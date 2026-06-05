@@ -43,7 +43,7 @@ pub struct Cli {
     daemon: bool,
     #[arg(short, long, help = "日志文件位置")]
     log: Option<String>,
-    #[arg(short, long, help = "完成删除中间文件", default_value = "false")]
+    #[arg(short, long, help = "完成后删除中间文件", default_value = "false")]
     clear: bool,
     #[arg(short, long, help = "跳过ts文件开头字节数", default_value = "0")]
     skip: usize,
@@ -55,10 +55,10 @@ pub struct Cli {
         long,
         help = "不使用代理",
         default_value = "false",
-        long_help = "如无该参数，将会尝试使用环境中的代理配置"
+        long_help = "如无该参数，将会尝试使用环境变量中的代理配置"
     )]
     no_proxy: bool,
-    #[arg(long, help = "ffmpeg可执行文件位置")]
+    #[arg(long, help = "ffmpeg可执行文件位置", long_help = "当自带ffmpeg无法实现合并时，可以指定外部ffmpeg")]
     ffmpeg: Option<String>,
     #[arg(
         long,
@@ -1813,6 +1813,7 @@ mod ff {
 
         // 初始化ffmpeg库
         ffmpeg::init().map_err(|e| format!("ffmpeg初始化失败: {}", e))?;
+        ffmpeg::util::log::set_level(ffmpeg::util::log::Level::Quiet);
 
         // 使用concat demuxer方式合并
         merge_with_concat(ts_files, output_path)
