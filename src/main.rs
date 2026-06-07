@@ -58,7 +58,11 @@ pub struct Cli {
         long_help = "如无该参数，将会尝试使用环境变量中的代理配置"
     )]
     no_proxy: bool,
-    #[arg(long, help = "ffmpeg可执行文件位置", long_help = "当自带ffmpeg无法实现合并时，可以指定外部ffmpeg")]
+    #[arg(
+        long,
+        help = "ffmpeg可执行文件位置",
+        long_help = "当自带ffmpeg无法实现合并时，可以指定外部ffmpeg"
+    )]
     ffmpeg: Option<String>,
     #[arg(
         long,
@@ -187,7 +191,12 @@ impl Item {
         } else {
             Ok(Item {
                 name: name.to_string(),
-                dir: dir.to_string(),
+                dir: if dir.ends_with("/") {
+                    &dir[..(dir.len() - 1)]
+                } else {
+                    dir
+                }
+                .to_string(),
                 url: url.to_string(),
                 exclude,
                 prefix,
@@ -1769,7 +1778,7 @@ impl Path {
 
 #[cfg(feature = "ffmpeg")]
 mod ff {
-    use ffmpeg_next::{self as ffmpeg, codec, encoder};
+    use ffmpeg_next::{self as ffmpeg, format, frame, packet, Rescale};
     use std::path::Path;
 
     /// 使用ffmpeg-next库合并多个ts文件成mp4
@@ -1871,20 +1880,42 @@ mod ff {
 
         log::info!("开始复制数据包...");
 
-        // 复制所有数据包
         let mut packet_count = 0;
-        for (_stream, packet) in input.packets() {
-            if packet.stream() == video_stream_idx {
-                packet
-                    .write_interleaved(&mut output)
-                    // output.write(&packet)
-                    .map_err(|e| format!("写入视频数据包失败: {}", e))?;
-                packet_count += 1;
-            } else if audio_stream_idx.map_or(false, |idx| packet.stream() == idx) {
-                packet
-                    .write_interleaved(&mut output)
-                    .map_err(|e| format!("写入音频数据包失败: {}", e))?;
-                packet_count += 1;
+
+        for (stream, mut packet) in input.packets() {
+            let stream_idx = packet.stream();
+
+            // 获取输入流的时间基
+            let input_stream = stream;
+            let in_time_base = input_stream.time_base();
+
+            // 获取输出流的时间基
+            let output_stream = output.stream(stream_idx).ok_or("找不到输出流")?;
+            let out_time_base = output_stream.time_base();
+
+            // 调整时间戳
+            if packet.pts().is_some() {
+                // 转换时间基
+                if let Some(pts) = packet.pts() {
+                    let new_pts = pts.rescale(in_time_base, out_time_base);
+                    packet.set_pts(Some(new_pts));
+                }
+                if let Some(dts) = packet.dts() {
+                    let new_dts = dts.rescale(in_time_base, out_time_base);
+                    packet.set_dts(Some(new_dts));
+                }
+            }
+
+            // 写入数据包
+            packet
+                .write_interleaved(&mut output)
+                .map_err(|e| format!("写入数据包失败: {}", e))?;
+
+            packet_count += 1;
+
+            // 进度日志
+            if packet_count % 1000 == 0 {
+                log::debug!("已处理 {} 个数据包", packet_count);
             }
         }
 
@@ -1916,25 +1947,27 @@ mod ff {
         let codec_id = input_stream.parameters().id();
         log::debug!("流 {} 编码格式: {:?}", stream_idx, codec_id);
 
-        // let encoder =
-        //     ffmpeg::encoder::find(codec_id).ok_or(format!("找不到编码器: {:?}", codec_id))?;
-
         let mut out_stream = output
-            .add_stream(encoder::find(codec::Id::None))
+            .add_stream(ffmpeg::encoder::find(ffmpeg::codec::Id::None))
             .map_err(|e| format!("添加输出流失败: {}", e))?;
 
+        // 完整复制流参数
         out_stream.set_parameters(input_stream.parameters());
+
+        // 关键：设置正确的时间基
         unsafe {
-            (*out_stream.parameters().as_mut_ptr()).codec_tag = 0;
+            let params = out_stream.parameters().as_mut_ptr();
+            (*params).codec_tag = 0;
         }
+
+        out_stream.set_time_base(input_stream.time_base());
         out_stream.set_metadata(input_stream.metadata().to_owned());
-        // out_stream.
-        log::debug!("流参数复制完成");
+
+        log::debug!("流参数复制完成，时间基: {:?}", input_stream.time_base());
 
         Ok(())
     }
 }
-
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::AtomicU32;

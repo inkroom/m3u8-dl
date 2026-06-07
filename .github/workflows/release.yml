@@ -22,7 +22,7 @@ jobs:
       - name: Install dependencies
         run: |
           apt update
-          apt install -y tree nasm curl pkg-config ca-certificates ffmpeg bsdmainutils unzip libavcodec-dev libavformat-dev libavutil-dev libavfilter-dev libavdevice-dev
+          apt install -y nasm curl pkg-config ca-certificates ffmpeg bsdmainutils
       - name: Cache FFmpeg
         id: ffmpeg-cache-mini
         uses: actions/cache@v5
@@ -45,11 +45,6 @@ jobs:
           ./configure --prefix=$cur/mini --disable-everything --enable-cross-compile --arch=x86_64 --target-os=linux --cross-prefix=x86_64-unknown-linux-musl- --disable-debug --enable-stripping --enable-static --enable-pthreads --disable-autodetect --enable-avcodec --enable-avformat  --extra-cflags=-w --disable-filters --disable-ffprobe --disable-avdevice --disable-swscale --disable-avfilter --disable-swresample --enable-muxer=mp4,flv,mkv,mp3,hevc,h264,h263,h261 --enable-demuxer=aac,m4v,h261,h263,h264,hevc,hls,mp3,ac,flv --enable-encoder=aac,flac,flv,mpeg4 --enable-decoder=aac,mp3,h261,h263,h163i,h263p,h264,hevc,yuv4,rv40 --enable-protocol=data,concat,concatf,data,crypto,async,cache,file,subfile,tee
           make && make install
           ls -all $cur/mini/lib
-      - uses: actions/cache/save@v5
-        if: steps.ffmpeg-cache-mini.outputs.cache-hit != 'true'
-        with:
-          path: mini
-          key: ffmpeg-${{ runner.os }}-mini
       - name: Compile FFmpeg Full
         if: steps.ffmpeg-cache-full.outputs.cache-hit != 'true'
         run: |
@@ -60,23 +55,15 @@ jobs:
           ./configure --prefix=$cur/full --enable-cross-compile --arch=x86_64 --target-os=linux --cross-prefix=x86_64-unknown-linux-musl- --disable-debug --enable-stripping --enable-static --disable-shared --enable-pthreads --enable-pic --disable-autodetect --disable-programs --disable-doc --disable-gpl --disable-version3 --disable-nonfree --enable-avcodec --disable-avdevice --disable-avfilter --enable-avformat --disable-swresample --disable-swscale --extra-cflags=-w
           make && make install
           ls -all $cur/full/lib
-      - uses: actions/cache/save@v5
-        if: steps.ffmpeg-cache-full.outputs.cache-hit != 'true'
-        with:
-          path: full
-          key: ffmpeg-${{ runner.os }}-full
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: ${{ env.RUST_VERSION }}
       - name: Build
         run: |
-          pwd
-          ls -all mini/lib
-          ls -all full/lib
           mkdir app
           echo "::group::无FFMPEG"
-          cargo build --release --target=$(arch)-unknown-linux-musl && mv target/x86_64-unknown-linux-musl/release/m3u8-dl app/m3u8-dl_linux-wioutffmpeg
+          cargo build --release --target=$(arch)-unknown-linux-musl && mv target/x86_64-unknown-linux-musl/release/m3u8-dl app/m3u8-dl_linux-withoutffmpeg
           echo "::endgroup::"
 
           echo "::group::full"
@@ -88,7 +75,6 @@ jobs:
           cargo clean
           FFMPEG_DIR="$(pwd)/mini" cargo build --release --target=$(arch)-unknown-linux-musl --features static && mv target/x86_64-unknown-linux-musl/release/m3u8-dl app/m3u8-dl_linux
           echo "::endgroup::"
-          tree ${{ github.workspace }}
       - name: Upload artifacts
         uses: actions/upload-artifact@v7
         with:
@@ -311,6 +297,17 @@ jobs:
             echo "after-$commit"
             msg=$(git --no-pager log --pretty=format:"- [%s](https://github.com/${{ github.repository}}/commit/%H)" $commit..HEAD)
             echo "$msg" > body.md
+            
+            cat <<EOF >> body.md
+            ---
+
+            默认带有ffmpeg，但是只支持常见(~~我见过的~~)编码格式
+
+            full是支持所有ffmpeg支持的编码
+
+            withoutffmpeg是不带ffmpeg，只能调用外部ffmpeg程序
+            EOF
+            
             echo "tag=$new_tag" >> $GITHUB_OUTPUT
             # 如果直接指向master，release会落后一个commit
             # gh release create -n "$msg" --target $new_tag $(date +%Y%m%d) ./app/*

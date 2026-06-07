@@ -1,2 +1,2 @@
 FROM inkbox/rust:1.95.0
-RUN apt update -y && apt install -y ffmpeg bsdmainutils unzip clang libavcodec-dev libavformat-dev libavutil-dev pkg-config libavfilter-dev libavdevice-dev
+RUN apt update -y && apt install -y nasm ffmpeg bsdmainutils clang pkg-config
