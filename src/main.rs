@@ -51,7 +51,7 @@ pub struct Cli {
     retry: usize,
     #[arg(long, help = "代理,如127.0.0.1:7382")]
     proxy: Option<String>,
-    #[arg(long, help = "关闭证书校验",default_value = "false")]
+    #[arg(long, help = "关闭证书校验", default_value = "false")]
     disable_cert: bool,
     #[arg(
         long,
@@ -727,7 +727,11 @@ mod ureqclient {
                 bu = bu.proxy(None);
             }
             if opt.disable_cert {
-                bu = bu.tls_config(ureq::tls::TlsConfig::builder().disable_verification(opt.disable_cert).build())
+                bu = bu.tls_config(
+                    ureq::tls::TlsConfig::builder()
+                        .disable_verification(opt.disable_cert)
+                        .build(),
+                )
             }
             Ok(UReqClient {
                 inner: bu.build().into(),
@@ -784,7 +788,8 @@ mod reqwestclient {
         where
             Self: Sized,
         {
-            let mut c = reqwest::blocking::Client::builder().danger_accept_invalid_certs(opt.disable_cert);
+            let mut c =
+                reqwest::blocking::Client::builder().danger_accept_invalid_certs(opt.disable_cert);
             if !opt.no_proxy {
                 if let Some(proxy) = &opt.proxy {
                     log::debug!("use proxy = {}", proxy);
@@ -1171,7 +1176,7 @@ mod custom_log {
     }
     pub(crate) fn init(opt: &Cli) -> Result<(), String> {
         if opt.verbose {
-            std::env::set_var("RUST_LOG", "debug");
+            std::env::set_var("RUST_LOG", "debug,ureq=trace");
         } else {
             std::env::set_var("RUST_LOG", "info");
         }
@@ -1179,10 +1184,24 @@ mod custom_log {
         let mut s = env_logger::builder();
         s.default_format()
             .parse_default_env()
-            .format(|buf, record| writeln!(buf, "{}: {}", time_format(), record.args()))
+            .format(|buf, record| {
+                writeln!(
+                    buf,
+                    "{}-[{:?}]: {}",
+                    time_format(),
+                    std::thread::current().id(),
+                    record.args()
+                )
+            })
             .target(env_logger::Target::Pipe(Box::new(Writer::new(opt))));
         if opt.verbose {
-            s.filter(Some("rustls"), log::LevelFilter::Off);
+            s.filter(Some("rustls"), log::LevelFilter::Off)
+            
+                // .filter(Some("ureq::run"), log::LevelFilter::Trace)
+                .filter(Some("ureq_proto::util"), log::LevelFilter::Debug)
+                .filter(Some("ureq::unversioned::resolver"), log::LevelFilter::Off)
+                .filter(Some("ureq_proto::client"), log::LevelFilter::Off)
+                ;
         }
         s.init();
         Ok(())
@@ -1488,7 +1507,6 @@ impl Opt {
             // 文件协议
             return std::fs::read(url.replace("file://", "")).map_err(|e| (e.to_string(), 500));
         }
-        log::debug!("headers={:?}", header);
         match &self.client {
             Some(c) => c.get(url, header),
             None => unreachable!(),
