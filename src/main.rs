@@ -51,6 +51,8 @@ pub struct Cli {
     retry: usize,
     #[arg(long, help = "代理,如127.0.0.1:7382")]
     proxy: Option<String>,
+    #[arg(long, help = "关闭证书校验",default_value = "false")]
+    disable_cert: bool,
     #[arg(
         long,
         help = "不使用代理",
@@ -711,22 +713,25 @@ mod ureqclient {
 
     impl HttpClient for UReqClient {
         fn init(opt: &Cli) -> Result<Self, std::string::String> {
-            let mut bu = ureq::AgentBuilder::new();
+            let mut bu = ureq::Agent::config_builder();
             if !opt.no_proxy {
                 if let Some(proxy) = &opt.proxy {
                     log::debug!("use proxy = {}", proxy);
-                    bu = bu.proxy(
-                        ureq::Proxy::new(proxy).map_err(|e| format!("unvalid proxy {}", proxy))?,
-                    );
+                    bu = bu.proxy(ureq::Proxy::new(proxy).ok());
                 } else {
                     log::debug!("use env proxy");
-                    bu = bu.try_proxy_from_env(true);
+                    bu = bu.proxy(ureq::Proxy::try_from_env());
                 }
             } else {
                 log::debug!("no proxy");
-                bu = bu.try_proxy_from_env(false);
+                bu = bu.proxy(None);
             }
-            Ok(UReqClient { inner: bu.build() })
+            if opt.disable_cert {
+                bu = bu.tls_config(ureq::tls::TlsConfig::builder().disable_verification(opt.disable_cert).build())
+            }
+            Ok(UReqClient {
+                inner: bu.build().into(),
+            })
         }
 
         fn get(
@@ -736,12 +741,15 @@ mod ureqclient {
         ) -> Result<Vec<u8>, (String, u16)> {
             let mut v = self.inner.get(url);
             for (key, value) in header.iter() {
-                v = v.set(&key, &value);
+                v = v.header(key.clone(), value.clone());
             }
-            let v = v.call().map_err(|e| {
+            let mut v = v.call().map_err(|e| {
                 (
                     format!("request error ={}", e),
-                    e.into_response().map(|f| f.status()).unwrap_or(0),
+                    match e {
+                        ureq::Error::StatusCode(c) => c,
+                        _ => 0,
+                    },
                 )
             })?;
             if v.status() == 200 {
@@ -749,16 +757,14 @@ mod ureqclient {
                 //     Some(v) => v,
                 //     None => return Err(("request no content-length".to_string(), v.status())),
                 // };
-                // TODO 这里会吃掉一些响应头，很奇怪
-                let mut bytes: Vec<u8> = Vec::new();
-                v.into_reader()
-                    .read_to_end(&mut bytes)
-                    .map_err(|e| (format!("reqeust fail , reason = [{}]", e), 200))?;
-                return Ok(bytes);
+                return Ok(v
+                    .body_mut()
+                    .read_to_vec()
+                    .map_err(|e| (format!("reqeust fail , reason = [{}]", e), 200))?);
             }
             Err((
-                format!("request fail, reason = [{}]", v.status_text()),
-                v.status(),
+                format!("request fail, reason = [{}]", v.status().as_str()),
+                v.status().as_u16(),
             ))
         }
     }
@@ -778,7 +784,7 @@ mod reqwestclient {
         where
             Self: Sized,
         {
-            let mut c = reqwest::blocking::Client::builder();
+            let mut c = reqwest::blocking::Client::builder().danger_accept_invalid_certs(opt.disable_cert);
             if !opt.no_proxy {
                 if let Some(proxy) = &opt.proxy {
                     log::debug!("use proxy = {}", proxy);

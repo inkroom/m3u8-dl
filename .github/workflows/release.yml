@@ -82,10 +82,14 @@ jobs:
           path: app/m3u8-dl_*
   windows:
     runs-on: windows-latest
+    strategy:
+      matrix:
+       type: [Full, Mini]
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
-      - name: Cache FFmpeg
+      - name: Cache FFmpeg Mini
+        if: ${{ matrix.type == 'Mini' }}
         id: ffmpeg-cache-mini
         uses: actions/cache@v5
         with:
@@ -93,8 +97,9 @@ jobs:
           path: |
             ${{ github.workspace }}/mini
           key: ffmpeg-${{ runner.os }}-mini
-      - name: Cache FFmpeg
+      - name: Cache FFmpeg Full
         id: ffmpeg-cache-full
+        if: ${{ matrix.type == 'Full' }}
         uses: actions/cache@v5
         with:
           # 你想要缓存的目录路径（支持绝对路径或相对路径）
@@ -102,7 +107,7 @@ jobs:
             ${{ github.workspace }}/full
           key: ffmpeg-${{ runner.os }}-full
       - name: Install FFmpeg Full
-        if: steps.ffmpeg-cache-full.outputs.cache-hit != 'true'
+        if: matrix.type == 'Full' && steps.ffmpeg-cache-full.outputs.cache-hit != 'true'
         run: |
           vcpkg install ffmpeg[core,avcodec,avformat]:x64-windows-static
           $srcPath = "C:/vcpkg/packages/ffmpeg_x64-windows-static"
@@ -110,8 +115,8 @@ jobs:
           Copy-Item -Path $srcPath -Destination $destPath -Recurse -Force
           ls ${{ github.workspace }}/full/lib
           vcpkg remove ffmpeg --recurse
-      - name: Install FFmpeg
-        if: steps.ffmpeg-cache-mini.outputs.cache-hit != 'true'
+      - name: Install FFmpeg Mini
+        if: matrix.type == 'Mini' && steps.ffmpeg-cache-mini.outputs.cache-hit != 'true'
         run: |
           git clone https://github.com/microsoft/vcpkg/ --depth=1 -b 2026.06.01
           New-Item -ItemType Directory -Force -Path "custom-ports/ffmpeg"
@@ -149,29 +154,33 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: ${{ env.RUST_VERSION }}
-      - name: Build
+      - name: Build Full Full
+        if: ${{ matrix.type == 'Full' }}
         env:
           RUSTFLAGS: "-C target-feature=+crt-static"
         run: |
           New-Item -ItemType Directory -Force -Path "app"
-          echo "::group::full"
           ls ${{ github.workspace }}/full/lib
           $env:FFMPEG_DIR = "${{ github.workspace }}/full"
           cargo build --release --features static -vv
           Copy-Item -Path target/release/m3u8-dl.exe -Destination app/m3u8-dl_windows-full.exe -Recurse -Force
-          echo "::endgroup::"
 
-          echo "::group::mini"
+      - name: Build Full Mini
+        if: ${{ matrix.type == 'Mini' }}
+        env:
+          RUSTFLAGS: "-C target-feature=+crt-static"
+        run: |
+          New-Item -ItemType Directory -Force -Path "app"
+
           cargo clean
           $env:FFMPEG_DIR = "${{ github.workspace }}/mini"
           ls ${{ github.workspace }}/mini/lib
           cargo build --release --features static -vv
           Copy-Item -Path target/release/m3u8-dl.exe -Destination app/m3u8-dl_windows.exe -Recurse -Force
-          echo "::endgroup::"
       - name: Upload artifacts
         uses: actions/upload-artifact@v7
         with:
-          name: app-windows
+          name: app-windows-${{ matrix.type }}
           path: |
             app/*.exe
   windows-check:

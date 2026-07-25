@@ -63,6 +63,9 @@ Options:
       --proxy <PROXY>
           代理,如127.0.0.1:7382
 
+      --disable-cert
+          关闭证书校验
+
       --no-proxy
           如无该参数，将会尝试使用环境变量中的代理配置
 
