@@ -1802,7 +1802,7 @@ impl Path {
 
 #[cfg(feature = "ffmpeg")]
 mod ff {
-    use ffmpeg_next::{self as ffmpeg, format, frame, packet, Rescale};
+    use ffmpeg_next as ffmpeg;
     use std::path::Path;
 
     /// 使用ffmpeg-next库合并多个ts文件成mp4
@@ -1889,12 +1889,16 @@ mod ff {
             log::debug!("找到音频流: 索引={}", idx);
         }
 
+        // 输入流索引不保证和输出流索引相同，显式保存映射关系。
+        let mut stream_mapping = vec![None; input.streams().len()];
+
         // 复制视频流
-        copy_stream(&mut input, &mut output, video_stream_idx)?;
+        stream_mapping[video_stream_idx] =
+            Some(copy_stream(&mut input, &mut output, video_stream_idx)?);
 
         // 复制音频流（如果存在）
         if let Some(audio_idx) = audio_stream_idx {
-            copy_stream(&mut input, &mut output, audio_idx)?;
+            stream_mapping[audio_idx] = Some(copy_stream(&mut input, &mut output, audio_idx)?);
         }
         output.set_metadata(input.metadata().to_owned());
         // 写入文件头
@@ -1905,30 +1909,60 @@ mod ff {
         log::info!("开始复制数据包...");
 
         let mut packet_count = 0;
+        let mut timestamp_offsets = vec![0_i64; input.streams().len()];
+        let mut last_dts = vec![None; input.streams().len()];
 
         for (stream, mut packet) in input.packets() {
-            let stream_idx = packet.stream();
+            let input_stream_idx = packet.stream();
+            let Some(output_stream_idx) = stream_mapping
+                .get(input_stream_idx)
+                .and_then(|index| *index)
+            else {
+                // 忽略没有复制到输出文件的数据流。
+                continue;
+            };
 
             // 获取输入流的时间基
             let input_stream = stream;
             let in_time_base = input_stream.time_base();
 
             // 获取输出流的时间基
-            let output_stream = output.stream(stream_idx).ok_or("找不到输出流")?;
+            let output_stream = output.stream(output_stream_idx).ok_or("找不到输出流")?;
             let out_time_base = output_stream.time_base();
 
-            // 调整时间戳
-            if packet.pts().is_some() {
-                // 转换时间基
-                if let Some(pts) = packet.pts() {
-                    let new_pts = pts.rescale(in_time_base, out_time_base);
-                    packet.set_pts(Some(new_pts));
+            // 有些 HLS 会在中途切换到另一个时间轴。MP4 要求每个流的 DTS
+            // 单调递增，因此检测回跳并把后续包平移到上一包之后。
+            if let Some(dts) = packet.dts() {
+                let adjusted_dts = dts.saturating_add(timestamp_offsets[input_stream_idx]);
+                if let Some(previous_dts) = last_dts[input_stream_idx] {
+                    if adjusted_dts <= previous_dts {
+                        let step = packet.duration().max(1);
+                        let correction = previous_dts
+                            .saturating_add(step)
+                            .saturating_sub(adjusted_dts);
+                        timestamp_offsets[input_stream_idx] =
+                            timestamp_offsets[input_stream_idx].saturating_add(correction);
+                        log::debug!(
+                            "流 {} 时间戳回跳，增加偏移 {}",
+                            input_stream_idx,
+                            correction
+                        );
+                    }
                 }
-                if let Some(dts) = packet.dts() {
-                    let new_dts = dts.rescale(in_time_base, out_time_base);
-                    packet.set_dts(Some(new_dts));
-                }
+
+                last_dts[input_stream_idx] =
+                    Some(dts.saturating_add(timestamp_offsets[input_stream_idx]));
             }
+
+            let offset = timestamp_offsets[input_stream_idx];
+            if let Some(pts) = packet.pts() {
+                packet.set_pts(Some(pts.saturating_add(offset)));
+            }
+            if let Some(dts) = packet.dts() {
+                packet.set_dts(Some(dts.saturating_add(offset)));
+            }
+            packet.rescale_ts(in_time_base, out_time_base);
+            packet.set_stream(output_stream_idx);
 
             // 写入数据包
             packet
@@ -1963,7 +1997,7 @@ mod ff {
         input: &mut ffmpeg::format::context::Input,
         output: &mut ffmpeg::format::context::Output,
         stream_idx: usize,
-    ) -> Result<(), String> {
+    ) -> Result<usize, String> {
         let input_stream = input
             .stream(stream_idx)
             .ok_or(format!("找不到流 {}", stream_idx))?;
@@ -1974,6 +2008,7 @@ mod ff {
         let mut out_stream = output
             .add_stream(ffmpeg::encoder::find(ffmpeg::codec::Id::None))
             .map_err(|e| format!("添加输出流失败: {}", e))?;
+        let output_stream_idx = out_stream.index();
 
         // 完整复制流参数
         out_stream.set_parameters(input_stream.parameters());
@@ -1989,7 +2024,7 @@ mod ff {
 
         log::debug!("流参数复制完成，时间基: {:?}", input_stream.time_base());
 
-        Ok(())
+        Ok(output_stream_idx)
     }
 }
 #[cfg(test)]
