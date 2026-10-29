@@ -10,6 +10,8 @@ on:
   workflow_dispatch:
 env:
   RUST_VERSION: 1.95.0
+  FFMPEG_VERSION: '8.1'
+  VCPKG_TAG: 2026.06.01
 jobs:
   linux: 
     runs-on: ubuntu-24.04
@@ -96,7 +98,7 @@ jobs:
           # 你想要缓存的目录路径（支持绝对路径或相对路径）
           path: |
             ${{ github.workspace }}/mini
-          key: ffmpeg-${{ runner.os }}-mini
+          key: ffmpeg-${{ runner.os }}-${{ env.FFMPEG_VERSION }}-mini
       - name: Cache FFmpeg Full
         id: ffmpeg-cache-full
         if: ${{ matrix.type == 'Full' }}
@@ -105,22 +107,43 @@ jobs:
           # 你想要缓存的目录路径（支持绝对路径或相对路径）
           path: |
             ${{ github.workspace }}/full
-          key: ffmpeg-${{ runner.os }}-full
+          key: ffmpeg-${{ runner.os }}-${{ env.FFMPEG_VERSION }}-full
+      - name: Set up FFmpeg 8.1 vcpkg port
+        if: steps.ffmpeg-cache-mini.outputs.cache-hit != 'true' && steps.ffmpeg-cache-full.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          git clone https://github.com/microsoft/vcpkg/ --depth=1 -b $env:VCPKG_TAG vcpkg
+          ./vcpkg/bootstrap-vcpkg.bat -disableMetrics
+
+          New-Item -ItemType Directory -Force -Path "custom-ports/ffmpeg"
+          Copy-Item -Path "./vcpkg/ports/ffmpeg/*" -Destination "custom-ports/ffmpeg" -Recurse -Force
+
+          # 强制 overlay port 下载 FFmpeg 官方 n8.1 tag，而不是 vcpkg 默认版本。
+          $manifestPath = "custom-ports/ffmpeg/vcpkg.json"
+          $manifest = Get-Content $manifestPath -Raw | ConvertFrom-Json
+          $manifest.version = $env:FFMPEG_VERSION
+          $manifest.'port-version' = 0
+          $manifest | ConvertTo-Json -Depth 100 | Set-Content $manifestPath
+
+          $portfile = "custom-ports/ffmpeg/portfile.cmake"
+          $content = Get-Content $portfile -Raw
+          $ffmpeg81Sha512 = "1dee3967057619dd7f2f78c63de85bb97af16c974bd9225c2336d42c7c8765c04f77490aac36af2daf953bc52c7faa37750a09265e133708f6a1709028573834"
+          $content = $content -replace 'SHA512 [0-9a-f]+', "SHA512 $ffmpeg81Sha512"
+          Set-Content -Path $portfile -Value $content
+
+          Write-Host "FFmpeg source tag: n$env:FFMPEG_VERSION"
+          Select-String -Path $portfile -Pattern 'REF|SHA512'
       - name: Install FFmpeg Full
         if: matrix.type == 'Full' && steps.ffmpeg-cache-full.outputs.cache-hit != 'true'
         run: |
-          vcpkg install ffmpeg[core,avcodec,avformat]:x64-windows-static
-          $srcPath = "C:/vcpkg/packages/ffmpeg_x64-windows-static"
+          ./vcpkg/vcpkg.exe install ffmpeg[core,avcodec,avformat]:x64-windows-static --overlay-ports=custom-ports
+          $srcPath = "${{ github.workspace }}/vcpkg/packages/ffmpeg_x64-windows-static"
           $destPath = "${{ github.workspace }}/full"
           Copy-Item -Path $srcPath -Destination $destPath -Recurse -Force
           ls ${{ github.workspace }}/full/lib
-          vcpkg remove ffmpeg --recurse
       - name: Install FFmpeg Mini
         if: matrix.type == 'Mini' && steps.ffmpeg-cache-mini.outputs.cache-hit != 'true'
         run: |
-          git clone https://github.com/microsoft/vcpkg/ --depth=1 -b 2026.06.01
-          New-Item -ItemType Directory -Force -Path "custom-ports/ffmpeg"
-          Copy-Item -Path "./vcpkg/ports/ffmpeg/*" -Destination "custom-ports/ffmpeg" -Recurse -Force
           $portfile = "custom-ports/ffmpeg/portfile.cmake"
           Get-Content $portfile
           $content = Get-Content $portfile
@@ -144,10 +167,10 @@ jobs:
           Get-Content $portfile
 
 
-          vcpkg install ffmpeg[core,avcodec,avformat]:x64-windows-static --overlay-ports=custom-ports --recurse
-          ls C:/vcpkg/packages/ffmpeg_x64-windows-static/
-          ls C:/vcpkg/packages/ffmpeg_x64-windows-static/lib
-          $srcPath = "C:/vcpkg/packages/ffmpeg_x64-windows-static"
+          ./vcpkg/vcpkg.exe install ffmpeg[core,avcodec,avformat]:x64-windows-static --overlay-ports=custom-ports --recurse
+          ls ${{ github.workspace }}/vcpkg/packages/ffmpeg_x64-windows-static/
+          ls ${{ github.workspace }}/vcpkg/packages/ffmpeg_x64-windows-static/lib
+          $srcPath = "${{ github.workspace }}/vcpkg/packages/ffmpeg_x64-windows-static"
           $destPath = "${{ github.workspace }}/mini"
           Copy-Item -Path $srcPath -Destination $destPath -Recurse -Force
           ls ${{ github.workspace }}/mini/lib
